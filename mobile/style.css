@@ -1,0 +1,183 @@
+:root{
+  --bg:#0b0f14; --panel:#141a23; --panel2:#1b2532; --line:#243040;
+  --fg:#e9eff7; --dim:#8ea3ba; --brand:#4d6bfe; --ok:#2fbf71; --bad:#e5484d;
+  --safe-b:env(safe-area-inset-bottom,0px); --safe-t:env(safe-area-inset-top,0px);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;height:100%;background:var(--bg);color:var(--fg);
+  font:15px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;
+  overscroll-behavior:none}
+body{position:fixed;inset:0;overflow:hidden}
+/* 整个 app 是一列：header / view；view 内部自己管布局 */
+#app{position:fixed;left:0;right:0;top:0;
+  display:flex;flex-direction:column;height:var(--app-h,100dvh);overflow:hidden;
+  transform:translateY(var(--vv-top,0px))}
+
+#top{flex:none;display:flex;align-items:center;gap:8px;
+  padding:calc(var(--safe-t) + 10px) 12px 10px;
+  background:rgba(11,15,20,.94);backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--line);z-index:10}
+#title{flex:1;font-weight:600;font-size:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.icon{background:none;border:0;color:var(--dim);font-size:22px;padding:2px 8px;line-height:1}
+
+/* 视图切换：必须显式处理 hidden（ID 选择器优先级高于 UA 的 [hidden]{display:none}） */
+.view{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.view[hidden]{display:none !important}
+
+/* 列表 */
+#sessions{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:8px 10px 24px}
+.row{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin-bottom:8px}
+.row:active{background:var(--panel2)}
+.row .t{font-weight:600;font-size:15px;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .m{display:flex;gap:8px;align-items:center;color:var(--dim);font-size:12px}
+.badge{font-size:11px;padding:1px 7px;border-radius:999px;background:#243244;color:#9fb3c8}
+.badge.run{background:rgba(77,107,254,.18);color:#9db0ff}
+
+/* 对话：只有 #messages 滚动，其余固定 */
+#messages{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
+  padding:14px 12px 10px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:92%;border-radius:16px;padding:10px 13px;white-space:pre-wrap;word-break:break-word;font-size:15px}
+.msg.user{align-self:flex-end;background:var(--brand);color:#fff;border-bottom-right-radius:6px}
+.msg.bot{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:6px}
+.msg.sys{align-self:center;background:none;color:var(--dim);font-size:12px;padding:2px}
+.msg.tool{align-self:flex-start;background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+  font-size:12px;font-family:ui-monospace,Menlo,monospace}
+.msg .think{color:var(--dim);font-size:12px;border-left:2px solid var(--line);padding-left:8px;margin-bottom:6px}
+
+/* 待答卡片固定在消息区与输入框之间 */
+#pending{flex:none;padding:0 12px;max-height:40vh;overflow-y:auto}
+#pending:empty{display:none}
+.card{background:var(--panel2);border:1px solid #3b4c63;border-radius:14px;padding:12px;margin-bottom:10px}
+.card .h{font-size:12px;color:#9db0ff;margin-bottom:6px;font-weight:600}
+.card .b{font-size:13px;color:var(--fg);white-space:pre-wrap;margin-bottom:10px;max-height:30vh;overflow:auto}
+.btns{display:flex;gap:8px}
+.btns button{flex:1;padding:11px;border-radius:11px;border:1px solid var(--line);background:var(--panel);
+  color:var(--fg);font-size:14px;font-weight:600}
+.btns .ok{background:var(--ok);border-color:var(--ok);color:#04140b}
+.btns .no{background:transparent;border-color:#4a2b2f;color:#ff8b8f}
+.card input{width:100%;padding:10px;border-radius:10px;border:1px solid var(--line);
+  background:var(--bg);color:var(--fg);margin-bottom:8px;font-size:15px}
+
+/* 输入区：永远钉在最下面 */
+#composer{flex:none;display:flex;align-items:flex-end;gap:8px;
+  padding:8px 10px 6px;
+  border-top:1px solid var(--line);background:rgba(11,15,20,.96)}
+#input{flex:1;resize:none;max-height:120px;padding:10px 12px;border-radius:14px;
+  border:1px solid var(--line);background:var(--panel);color:var(--fg);font:inherit;font-size:15px;
+  line-height:1.4;outline:none}
+#send{padding:0 16px;height:40px;border-radius:14px;border:0;background:var(--brand);
+  color:#fff;font-weight:600;font-size:15px;flex:none}
+#send[disabled]{opacity:.45}
+
+#toast{position:fixed;left:50%;bottom:calc(var(--safe-b) + 84px);transform:translateX(-50%);
+  background:#243244;color:#fff;font-size:13px;padding:8px 14px;border-radius:999px;z-index:50;max-width:86vw}
+#toast[hidden]{display:none}
+.empty{color:var(--dim);text-align:center;padding:48px 16px;font-size:14px}
+
+#gate{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:80;padding:24px}
+#gate[hidden]{display:none}
+.gate-box{max-width:320px;text-align:center}
+.gate-title{font-size:18px;font-weight:600;margin-bottom:8px}
+.gate-text{color:var(--dim);font-size:14px;line-height:1.6;margin-bottom:18px;white-space:pre-wrap}
+#gate-btn{padding:12px 28px;border-radius:14px;border:0;background:var(--brand);color:#fff;font-size:15px;font-weight:600}
+
+#stop{flex:none;height:40px;padding:0 14px;border-radius:14px;border:1px solid #4a2b2f;background:transparent;color:#ff8b8f;font-size:14px;font-weight:600}
+#stop[hidden]{display:none}
+#mode{flex:none;height:40px;padding:0 10px;border-radius:14px;border:1px solid var(--line);background:var(--panel);color:var(--dim);font-size:13px}
+#mode.steer{color:#9db0ff;border-color:#3b4c63}
+.msg.bot.live::after{content:"▌";color:var(--brand);animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+.badge.pend{background:rgba(229,72,77,.18);color:#ff8b8f}
+
+/* 下拉刷新 */
+#ptr{flex:none;height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;
+  color:var(--dim);font-size:13px;transition:height .12s ease}
+#ptr.on{height:46px}
+#ptr.loading{color:#9db0ff}
+
+/* 顶栏版本号 */
+#ver{color:var(--dim);font-size:11px;font-family:ui-monospace,Menlo,monospace;padding:0 4px;flex:none}
+
+/* 模型条 */
+#modelbar{flex:none;display:flex;align-items:center;gap:6px;padding:7px 12px;
+  background:var(--panel);border:0;border-bottom:1px solid var(--line);
+  color:var(--dim);font-size:13px;text-align:left;width:100%}
+#modelbar:active{background:var(--panel2)}
+#modelbar .caret{color:var(--brand);font-size:11px}
+
+/* 模型选择面板 */
+#modelsheet{position:fixed;inset:0;z-index:90;display:flex;align-items:flex-end}
+#modelsheet[hidden]{display:none}
+.sheet-mask{position:absolute;inset:0;background:rgba(0,0,0,.55)}
+.sheet{position:relative;width:100%;max-height:78vh;display:flex;flex-direction:column;
+  background:var(--panel);border-radius:18px 18px 0 0;border-top:1px solid var(--line);
+  padding-bottom:var(--safe-b)}
+.sheet-head{flex:none;display:flex;align-items:center;justify-content:space-between;
+  padding:14px 16px;border-bottom:1px solid var(--line);font-weight:600}
+.sheet-head button{background:none;border:0;color:var(--brand);font-size:14px}
+#model-list{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:8px 10px 16px}
+.mgroup{padding:10px 6px 4px;color:var(--dim);font-size:12px;letter-spacing:.02em}
+.mrow{display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:12px 12px;border-radius:12px;background:var(--panel2);margin-bottom:6px}
+.mrow:active{background:#22304a}
+.mname{font-size:14px;color:var(--fg)}
+.msub{font-size:11px;color:var(--dim)}
+.mrow.cur{border:1px solid var(--brand)}
+
+#stats{flex:none;padding:4px 12px 6px;color:var(--dim);font-size:11px;
+  font-family:ui-monospace,Menlo,monospace;background:var(--panel);border-bottom:1px solid var(--line)}
+#stats:empty{display:none}
+
+/* 思考过程：默认折叠，只占一行 */
+details.think{color:var(--dim);font-size:12px;border-left:2px solid var(--line);
+  padding-left:8px;margin-bottom:8px}
+details.think summary{cursor:pointer;color:#9db0ff;font-size:12px;list-style:none}
+details.think summary::-webkit-details-marker{display:none}
+details.think summary::before{content:"▸ "}
+details.think[open] summary::before{content:"▾ "}
+details.think .think-body{white-space:pre-wrap;margin-top:6px;max-height:40vh;overflow:auto;
+  font-family:ui-monospace,Menlo,monospace;line-height:1.5;color:var(--dim)}
+.think-live{color:var(--dim);font-size:12px;margin-bottom:6px;font-style:italic}
+
+/* 图片：待发送缩略图 */
+#thumbs{flex:none;display:flex;gap:8px;padding:8px 10px 0;overflow-x:auto;background:rgba(11,15,20,.96)}
+#thumbs[hidden]{display:none}
+.thumb{position:relative;flex:none;width:64px;height:64px;border-radius:10px;overflow:hidden;border:1px solid var(--line)}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb button{position:absolute;top:2px;right:2px;width:20px;height:20px;border-radius:50%;border:0;
+  background:rgba(0,0,0,.65);color:#fff;font-size:12px;line-height:1;padding:0}
+#attach{flex:none;height:40px;width:40px;border-radius:14px;border:1px solid var(--line);
+  background:var(--panel);color:var(--fg);font-size:20px;line-height:1;padding:0}
+.msg img.att{max-width:100%;border-radius:10px;display:block;margin-top:6px}
+
+#attachfile{flex:none;height:40px;width:40px;border-radius:14px;border:1px solid var(--line);
+  background:var(--panel);color:var(--fg);font-size:17px;line-height:1;padding:0}
+.fcard{position:relative;flex:none;display:flex;flex-direction:column;justify-content:center;
+  min-width:120px;max-width:180px;height:64px;padding:8px 26px 8px 10px;border-radius:12px;
+  border:1px solid var(--line);background:var(--panel2)}
+.fcard .n{font-size:12px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fcard .s{font-size:11px;color:var(--dim);margin-top:2px}
+.fcard button{position:absolute;top:4px;right:4px;width:20px;height:20px;border-radius:50%;border:0;
+  background:rgba(0,0,0,.6);color:#fff;font-size:12px;line-height:1;padding:0}
+
+/* 工作区分组标题 */
+.ws-group{display:flex;align-items:baseline;gap:8px;padding:12px 6px 6px}
+.ws-title{font-size:12px;font-weight:600;color:#9fb3c8;letter-spacing:.03em}
+.ws-path{font-size:11px;color:var(--dim);font-family:ui-monospace,Menlo,monospace}
+
+/* 输入框始终贴底：不再保留底部安全区空白 */
+
+/* 等待区（排队中的消息） */
+#queue{flex:none;display:flex;flex-direction:column;gap:4px;padding:8px 10px 0;
+  background:rgba(11,15,20,.96)}
+#queue[hidden]{display:none}
+.qitem{display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:10px;
+  background:rgba(80,120,255,.12);border:1px solid rgba(80,120,255,.35);font-size:12px;color:var(--fg)}
+.qitem .t{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qitem .tag{color:#9db0ff;font-size:11px;flex:none}
+.qitem button{flex:none;width:20px;height:20px;border-radius:50%;border:0;padding:0;
+  background:rgba(255,255,255,.12);color:var(--fg);font-size:12px;line-height:1}
+
+/* 富文本输入模式（实验：测试能否去掉 iOS 白条） */
+#input[contenteditable]{white-space:pre-wrap;word-break:break-word;overflow-y:auto;min-height:40px}
+#input[contenteditable]:empty::before{content:attr(data-placeholder);color:var(--dim);pointer-events:none}

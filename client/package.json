@@ -1,0 +1,59 @@
+{
+  "name": "dsh-desktop",
+  "productName": "DSH Desktop",
+  "version": "1.3.2",
+  "description": "DSH 桌面客户端（绿色版 · WS 帧级缓存 · 自动升级）",
+  "main": "main.cjs",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "pack:win": "electron-packager . \"DSH-Desktop\" --platform=win32 --arch=x64 --out=../dist --asar=false --overwrite --prune=false --app-version=1.1.1"
+  },
+  "devDependencies": {
+    "electron-builder": "^24.13.3",
+    "electron-packager": "^17.1.2"
+  },
+  "dependencies": {
+    "ws": "^8.22.1"
+  },
+  "build": {
+    "appId": "com.example.dshdesktop",
+    "productName": "DSH Desktop",
+    "electronVersion": "45.2.2",
+    "files": [
+      "main.cjs",
+      "updater.cjs",
+      "apply-update.cjs",
+      "proxy.mjs",
+      "ws-mux.mjs",
+      "package.json",
+      "default-config.json",
+      "使用说明.txt"
+    ],
+    "extraResources": [],
+    "directories": {
+      "output": "../builder-dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DSH Desktop",
+      "artifactName": "DSH-Desktop-Setup-${version}.exe",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}

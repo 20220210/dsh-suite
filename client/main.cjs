@@ -1,0 +1,955 @@
+// DSH 桌面版 v1.2.0 —— Electron 主进程（绿色版）
+// 职责：单实例 → 准备配置 → 拉起本地缓存代理 → 等代理就绪 → 打开窗口
+//       → 首次运行创建桌面快捷方式 → 定期检查更新（一键升级）
+const { app, BrowserWindow, Menu, dialog, shell, Tray, nativeImage, Notification, safeStorage, nativeTheme } = require('electron');
+const path = require('node:path');
+const fs = require('node:fs');
+const http = require('node:http');
+const crypto = require('node:crypto');
+const { spawn, spawnSync } = require('node:child_process');
+const { createUpdater } = require('./updater.cjs');
+const { applyPendingUpdate } = require('./apply-update.cjs');
+
+const PROXY_PORT = 19390;
+const PROXY_URL = `http://127.0.0.1:${PROXY_PORT}/`;
+
+// 调试用：设置 DSH_DEBUG_CDP=1 时开放 Chrome DevTools 协议端口（排查界面问题用，默认关闭）
+if (process.env.DSH_DEBUG_CDP === '1') {
+  app.commandLine.appendSwitch('remote-debugging-port', '9222');
+}
+
+let mainWindow = null;
+let proxyChild = null;
+let updater = null;
+let checkTimer = null;
+let tray = null;
+let isQuitting = false;
+let notifyTimer = null;
+let authWarned = false;
+let trayHintShown = false;
+
+// ------------------------------------------------ 配置
+
+function userDataDir() {
+  return app.getPath('userData');
+}
+
+function installDir() {
+  return path.dirname(process.execPath);
+}
+
+function logFile() {
+  const dir = path.join(userDataDir(), 'logs');
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, 'proxy.log');
+}
+
+function mainLog(...args) {
+  try {
+    fs.appendFileSync(logFile(), `[${new Date().toISOString()}] [main] ${args.join(' ')}\n`);
+  } catch {}
+}
+
+function updateLogFile() {
+  const dir = path.join(userDataDir(), 'logs');
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, 'update.log');
+}
+
+function configPath() {
+  return path.join(userDataDir(), 'config.json');
+}
+
+function readConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(configPath(), 'utf8').replace(/^\uFEFF/, ''));
+  } catch {
+    return {};
+  }
+}
+
+const SECRET_FIELDS = [
+  ['basicPass', 'basicPassEnc'],
+  ['token', 'tokenEnc'],
+];
+
+function writeConfigRaw(cfg) {
+  try {
+    fs.mkdirSync(userDataDir(), { recursive: true });
+    fs.writeFileSync(configPath(), JSON.stringify(cfg, null, 2));
+  } catch (error) {
+    console.error('保存配置失败', error);
+  }
+}
+
+/** 保存配置：密码/token 一律加密后写盘（Windows DPAPI）。 */
+function saveConfig(cfg) {
+  const out = { ...cfg };
+  if (safeStorage.isEncryptionAvailable()) {
+    for (const [plain, enc] of SECRET_FIELDS) {
+      if (typeof out[plain] === 'string' && out[plain]) {
+        try {
+          out[enc] = safeStorage.encryptString(out[plain]).toString('base64');
+          delete out[plain];
+        } catch {}
+      }
+    }
+  }
+  writeConfigRaw(out);
+}
+
+/** 运行时配置：把加密字段解密成明文（只用于进程内/传给代理，不落盘）。 */
+function runtimeConfig() {
+  const cfg = readConfig();
+  if (!safeStorage.isEncryptionAvailable()) return cfg;
+  for (const [plain, enc] of SECRET_FIELDS) {
+    if (!cfg[plain] && cfg[enc]) {
+      try {
+        cfg[plain] = safeStorage.decryptString(Buffer.from(cfg[enc], 'base64'));
+      } catch {}
+    }
+  }
+  return cfg;
+}
+
+/** 老配置里的明文密码/token → 用 DPAPI 加密后重写（只做一次）。 */
+function migrateSecrets() {
+  if (!safeStorage.isEncryptionAvailable()) return;
+  const cfg = readConfig();
+  let changed = false;
+  for (const [plain, enc] of SECRET_FIELDS) {
+    if (typeof cfg[plain] === 'string' && cfg[plain]) {
+      try {
+        cfg[enc] = safeStorage.encryptString(cfg[plain]).toString('base64');
+        delete cfg[plain];
+        changed = true;
+      } catch {}
+    }
+  }
+  if (changed) {
+    writeConfigRaw(cfg);
+    mainLog('凭据已用 DPAPI 加密写入 config.json');
+  }
+}
+
+/** cookie 加密密钥：DPAPI 保护，明文不落盘。 */
+function cookieKey() {
+  try {
+    const dir = path.join(process.env.LOCALAPPDATA || userDataDir(), 'dsh-client');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'secret.key');
+    if (fs.existsSync(file)) {
+      const raw = fs.readFileSync(file, 'utf8').trim();
+      if (raw) return safeStorage.decryptString(Buffer.from(raw, 'base64'));
+    }
+    if (!safeStorage.isEncryptionAvailable()) return null;
+    const key = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(file, safeStorage.encryptString(key).toString('base64'), { mode: 0o600 });
+    return key;
+  } catch (error) {
+    console.error('初始化缓存加密密钥失败', error);
+    return null;
+  }
+}
+
+/** 收紧配置文件与缓存目录权限：只留当前用户 + SYSTEM + Administrators。 */
+function hardenAcl() {
+  if (process.platform !== 'win32') return;
+  const user = process.env.USERDOMAIN ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME || '';
+  const targets = [userDataDir(), path.join(process.env.LOCALAPPDATA || userDataDir(), 'dsh-client')];
+  const run = (args) => spawnSync('icacls.exe', args, { windowsHide: true, timeout: 60000 });
+  for (const target of targets) {
+    try {
+      if (!target || !fs.existsSync(target)) continue;
+      // 1) 目录本身去掉继承，设置可继承的权限
+      run([target, '/inheritance:r', '/grant:r', `${user}:(OI)(CI)F`, 'SYSTEM:(OI)(CI)F', 'Administrators:(OI)(CI)F', '/C', '/Q']);
+      // 2) 已存在的文件补“显式”权限（文件不能用 (OI)(CI)，否则会变成空 ACL 导致自己都读不了）
+      run([target, '/T', '/C', '/Q', '/grant:r', `${user}:F`, 'SYSTEM:F', 'Administrators:F']);
+      // 3) 再让所有子目录带上可继承权限，保证以后新建的文件也能继承
+      run([target, '/T', '/C', '/Q', '/grant:r', `${user}:(OI)(CI)F`, 'SYSTEM:(OI)(CI)F', 'Administrators:(OI)(CI)F']);
+      mainLog(`ACL 收紧完成 ${target}`);
+    } catch (error) {
+      mainLog(`ACL 收紧失败 ${target}: ${String(error?.message ?? error)}`);
+    }
+  }
+}
+
+function ensureConfig() {
+  const target = configPath();
+  if (fs.existsSync(target)) return target;
+  const candidates = [
+    path.join(__dirname, 'default-config.json'),
+    path.join(process.resourcesPath || '', 'app', 'default-config.json'),
+  ];
+  let source = null;
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) {
+      source = c;
+      break;
+    }
+  }
+  fs.mkdirSync(userDataDir(), { recursive: true });
+  if (source) fs.copyFileSync(source, target);
+  else fs.writeFileSync(target, JSON.stringify({ upstream: '', token: '', basicUser: '', basicPass: '' }, null, 2));
+  return target;
+}
+
+// ------------------------------------------------ 桌面快捷方式（绿色版用）
+
+function shortcutPath() {
+  try {
+    return path.join(app.getPath('desktop'), 'DSH Desktop.lnk');
+  } catch {
+    return null;
+  }
+}
+
+// ------------------------------------------------ 图标（统一用 DSH 官方鲸鱼 logo，深浅色自适应）
+
+function isDarkTheme() {
+  try {
+    return nativeTheme.shouldUseDarkColors;
+  } catch {
+    return true;
+  }
+}
+
+function windowIconPath() {
+  return path.join(__dirname, 'assets', isDarkTheme() ? 'icon-white-256.png' : 'icon-black-256.png');
+}
+
+function trayIconPath() {
+  return path.join(__dirname, 'assets', isDarkTheme() ? 'tray-white.ico' : 'tray-black.ico');
+}
+
+function shortcutIconPath() {
+  const p = path.join(__dirname, 'assets', 'dsh.ico');
+  return fs.existsSync(p) ? p : undefined;
+}
+
+function applyThemeIcons() {
+  try {
+    if (tray) tray.setImage(nativeImage.createFromPath(trayIconPath()));
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setIcon(windowIconPath());
+  } catch {}
+}
+
+function ensureDesktopShortcut({ quiet = false } = {}) {
+  if (process.platform !== 'win32') return;
+  const lnk = shortcutPath();
+  if (!lnk) return;
+  const target = process.execPath;
+  const exists = fs.existsSync(lnk);
+  let same = false;
+  if (exists) {
+    try {
+      const info = shell.readShortcutLink(lnk);
+      same = path.resolve(String(info.target || '')) === path.resolve(target);
+      if (same && String(info.appUserModelId || '') !== 'com.dsh.desktop') same = false;
+      const ico = shortcutIconPath();
+      if (same && ico && path.resolve(String(info.icon || '')) !== path.resolve(ico)) same = false;
+    } catch {}
+  }
+  if (same && quiet) return; // 已经指向当前位置，静默模式下不打扰
+  const operation = exists ? 'replace' : 'create';
+  try {
+    const ok = shell.writeShortcutLink(lnk, operation, {
+      target,
+      cwd: path.dirname(target),
+      icon: shortcutIconPath() ?? target,
+      iconIndex: 0,
+      description: 'DSH 桌面版（本地缓存加速）',
+      appUserModelId: 'com.dsh.desktop',
+    });
+    if (!quiet) {
+      dialog.showMessageBox({
+        type: ok ? 'info' : 'warning',
+        title: '桌面快捷方式',
+        message: ok ? '已创建桌面快捷方式：DSH Desktop' : '创建桌面快捷方式失败',
+        detail: ok ? '以后可以从桌面直接打开。' : '可以手动右键 “DSH Desktop.exe” → 发送到 → 桌面快捷方式。',
+        buttons: ['好的'],
+        noLink: true,
+      });
+    }
+  } catch (error) {
+    if (!quiet) {
+      dialog.showMessageBox({
+        type: 'warning',
+        title: '桌面快捷方式',
+        message: '创建桌面快捷方式失败：' + error.message,
+        buttons: ['好的'],
+        noLink: true,
+      });
+    }
+  }
+}
+
+// Windows 通知需要“开始菜单里带 AppUserModelID 的快捷方式”
+function ensureStartMenuShortcut() {
+  if (process.platform !== 'win32') return;
+  try {
+    const dir = path.join(process.env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs');
+    if (!dir || !fs.existsSync(dir)) return;
+    const lnk = path.join(dir, 'DSH Desktop.lnk');
+    const target = process.execPath;
+    if (fs.existsSync(lnk)) {
+      try {
+        const info = shell.readShortcutLink(lnk);
+        const sameTarget = path.resolve(String(info.target || '')) === path.resolve(target);
+        const sameAumid = String(info.appUserModelId || '') === 'com.dsh.desktop';
+        const ico = shortcutIconPath();
+        const sameIcon = !ico || path.resolve(String(info.icon || '')) === path.resolve(ico);
+        if (sameTarget && sameAumid && sameIcon) return;
+      } catch {}
+    }
+    shell.writeShortcutLink(lnk, fs.existsSync(lnk) ? 'replace' : 'create', {
+      target,
+      cwd: path.dirname(target),
+      icon: shortcutIconPath() ?? target,
+      iconIndex: 0,
+      description: 'DSH 桌面版',
+      appUserModelId: 'com.dsh.desktop',
+    });
+    mainLog('已创建带 AUMID 的开始菜单快捷方式');
+  } catch (error) {
+    mainLog('创建开始菜单快捷方式失败: ' + String(error?.message ?? error));
+  }
+}
+
+// ------------------------------------------------ 代理子进程
+
+function startProxy(cfgPath) {
+  const proxyScript = path.join(__dirname, 'proxy.mjs');
+  const out = fs.createWriteStream(logFile(), { flags: 'a' });
+  const runtime = runtimeConfig();
+  const secrets = { basicUser: runtime.basicUser ?? '', basicPass: runtime.basicPass ?? '', token: runtime.token ?? '' };
+  const key = cookieKey();
+  const extraEnv = { DSH_CLIENT_CONFIG: cfgPath, DSH_CLIENT_SECRETS: JSON.stringify(secrets) };
+  if (key) extraEnv.DSH_CLIENT_KEY = key;
+  proxyChild = spawn(process.execPath, [proxyScript, '--no-open'], {
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1', // 用 Electron 内置 Node 跑 ESM 脚本，用户无需装 Node
+      ...extraEnv,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  proxyChild.stdout.pipe(out);
+  proxyChild.stderr.pipe(out);
+  proxyChild.on('exit', (code) => {
+    out.write(`\n[main] 代理退出 code=${code}\n`);
+  });
+  proxyChild.on('error', (error) => {
+    out.write(`\n[main] 代理启动失败: ${error}\n`);
+  });
+}
+
+function stopProxy() {
+  if (proxyChild && !proxyChild.killed) {
+    try {
+      proxyChild.kill();
+    } catch {}
+  }
+}
+
+function proxyInfo() {
+  return new Promise((resolve) => {
+    const req = http.get(`${PROXY_URL}__proxy/stats`, { timeout: 1500 }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => (body += chunk));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
+/** 端口上如果跑着旧版本的代理，先杀掉，避免升级后仍用旧代理。 */
+function killStaleProxy(pid) {
+  if (!pid) return;
+  try {
+    require('node:child_process').spawnSync('taskkill.exe', ['/PID', String(pid), '/F'], { windowsHide: true, timeout: 10000 });
+  } catch {}
+}
+
+function proxyAlive() {
+  return new Promise((resolve) => {
+    const req = http.get(PROXY_URL, { timeout: 1500 }, (res) => {
+      res.resume();
+      resolve(true);
+    });
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+async function waitProxy(timeoutMs = 60000) {
+  const started = Date.now();
+  for (;;) {
+    if (await proxyAlive()) return true;
+    if (Date.now() - started > timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+}
+
+// ------------------------------------------------ 托盘 / 开机自启
+
+function showWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function autostartEnabled() {
+  try {
+    return Boolean(app.getLoginItemSettings().openAtLogin);
+  } catch {
+    return false;
+  }
+}
+
+function setAutostart(enabled) {
+  try {
+    app.setLoginItemSettings({ openAtLogin: Boolean(enabled), path: process.execPath, args: [] });
+  } catch (error) {
+    console.error('设置开机自启失败', error);
+  }
+}
+
+function setupTray() {
+  if (process.platform !== 'win32' || tray) return;
+  try {
+    const iconPath = trayIconPath();
+    const image = fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
+    tray = new Tray(image);
+    tray.setToolTip('DSH 桌面版');
+    mainLog(`托盘图标 ${image.isEmpty() ? '加载失败' : `已加载 ${image.getSize().width}x${image.getSize().height}`}（${isDarkTheme() ? '深色' : '浅色'}主题）`);
+    const menu = Menu.buildFromTemplate([
+      { label: '打开主界面', click: () => showWindow() },
+      { label: '检查更新…', click: () => updater?.check({ manual: true }) },
+      { label: '连接 / 缓存状态…', click: () => showProxyStats() },
+      { label: '发送测试通知', click: () => notifyTaskDone('测试会话', 75000) },
+      { type: 'separator' },
+      {
+        label: '开机自动启动',
+        type: 'checkbox',
+        checked: autostartEnabled(),
+        click: (item) => {
+          setAutostart(item.checked);
+          const cfg = readConfig();
+          cfg.autoStart = Boolean(item.checked);
+          saveConfig(cfg);
+        },
+      },
+      { type: 'separator' },
+      {
+        label: '退出',
+        click: () => {
+          isQuitting = true;
+          app.quit();
+        },
+      },
+    ]);
+    tray.setContextMenu(menu);
+    mainLog('托盘图标已创建');
+    nativeTheme.on('updated', applyThemeIcons);
+    tray.on('double-click', () => showWindow());
+    tray.on('click', () => showWindow());
+  } catch (error) {
+    console.error('创建托盘失败', error);
+  }
+}
+
+// ------------------------------------------------ 任务完成通知（Windows 右下角系统通知）
+
+function notifyTaskDone(title, durationMs) {
+  const name = String(title || '').trim() || '会话';
+  const seconds = Math.max(1, Math.round(durationMs / 1000));
+  const cost = seconds >= 90 ? `${Math.round(seconds / 60)} 分钟` : `${seconds} 秒`;
+  const body = `「${name}」已完成（用时 ${cost}）`;
+  const payload = { title: 'DSH 任务完成', body };
+  try {
+    if (Notification.isSupported()) {
+      const n = new Notification({ title: payload.title, body: payload.body, silent: false });
+      n.on('click', () => showWindow());
+      n.show();
+      mainLog(`系统通知已发送：${payload.body}`);
+      return;
+    }
+  } catch {}
+  try {
+    tray?.displayBalloon({ title: payload.title, content: payload.body, iconType: 'info' });
+    mainLog(`托盘气泡已发送：${payload.body}`);
+  } catch {}
+}
+
+function fetchWatch() {
+  return new Promise((resolve) => {
+    const req = http.get(`${PROXY_URL}__proxy/watch`, { timeout: 4000 }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => (body += chunk));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+  });
+}
+
+let runningSince = new Map();
+async function pollWatch() {
+  const data = await fetchWatch();
+  if (!data || !Array.isArray(data.items)) return;
+  const cfg = readConfig();
+  const ncfg = cfg.notify || {};
+  if (ncfg.enabled === false) return;
+  const minSeconds = Math.max(0, Number(ncfg.minSeconds ?? 20));
+  const onlyUnfocused = ncfg.onlyWhenUnfocused !== false;
+  const focused = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused());
+  const now = Date.now();
+  for (const item of data.items) {
+    // 修 bug：以前这里存的是时间戳数字，下面却读 prev.since（undefined）
+    // → duration = NaN → 永远不满足条件，通知一次都没发出去过。
+    const since = runningSince.get(item.sessionId);
+    if (item.running) {
+      if (since === undefined) runningSince.set(item.sessionId, now);
+    } else if (since !== undefined) {
+      const duration = now - since;
+      runningSince.delete(item.sessionId);
+      if (duration >= minSeconds * 1000 && (!onlyUnfocused || !focused || !mainWindow?.isVisible())) {
+        notifyTaskDone(item.title, duration);
+      }
+    }
+  }
+}
+
+function startNotifyWatcher() {
+  stopNotifyWatcher();
+  notifyTimer = setInterval(() => {
+    pollWatch().catch(() => {});
+  }, 5000);
+  notifyTimer.unref?.();
+}
+
+function stopNotifyWatcher() {
+  if (notifyTimer) clearInterval(notifyTimer);
+  notifyTimer = null;
+}
+
+// ------------------------------------------------ 令牌失效提示
+
+function showTokenUpdateHelp() {
+  const current = readConfig();
+  const masked = current.tokenEnc ? '（已加密保存）' : '（未设置）';
+  const opts = {
+    type: 'info',
+    title: '更新访问令牌',
+    message: '访问令牌已加密保存',
+    detail: [
+      `配置文件：${configPath()}`,
+      `当前令牌：${masked}`,
+      '',
+      '如果服务器端换了 token（或登录失败提示凭据失效）：',
+      '1. 点下面「打开配置文件」；',
+      '2. 在 JSON 里加一行  "token": "新的token"  （existing 的 tokenEnc 可以留着）；',
+      '3. 保存后重启 DSH 桌面版（退出托盘图标再打开即可）。',
+      '',
+      '保存后客户端会自动加密明文 token，不会以明文留在磁盘上。',
+      'BasicAuth 用户名/密码同理：加 "basicUser"/"basicPass" 后重启。',
+    ].join('\n'),
+    buttons: ['打开配置文件', '取消'],
+    noLink: true,
+  };
+  const show = mainWindow && !mainWindow.isDestroyed() ? dialog.showMessageBox(mainWindow, opts) : dialog.showMessageBox(opts);
+  show.then((r) => {
+    if (r.response === 0) shell.openPath(configPath()).catch(() => {});
+  });
+}
+
+function checkAuthState(stats) {
+  if (!stats) return;
+  if (stats.authError && !authWarned) {
+    authWarned = true;
+    const opts = {
+      type: 'warning',
+      title: '登录凭据失效',
+      message: '访问令牌可能已过期或被更换',
+      detail: '客户端会自动尝试重新登录；如果一直失败，请在「帮助 → 更新访问令牌」里更新 token。',
+      buttons: ['更新令牌', '稍后'],
+      noLink: true,
+    };
+    const show = mainWindow && !mainWindow.isDestroyed() ? dialog.showMessageBox(mainWindow, opts) : dialog.showMessageBox(opts);
+    show.then((r) => {
+      if (r.response === 0) showTokenUpdateHelp();
+    });
+  }
+}
+
+// ------------------------------------------------ 自动更新
+
+function setupUpdater() {
+  updater = createUpdater({
+    app,
+    dialog,
+    getWindow: () => mainWindow,
+    getConfig: runtimeConfig,
+    saveConfig,
+    installDir,
+    updateLog: updateLogFile,
+    openPath: (p) => shell.openPath(p).catch(() => {}),
+    openExternal: (u) => shell.openExternal(u).catch(() => {}),
+  });
+
+  const cfg = readConfig();
+  const update = cfg.update || {};
+  if (update.enabled === false) return;
+
+  const hours = Number(update.checkIntervalHours || 6);
+  const everyMs = Math.max(1, hours) * 3600 * 1000;
+
+  // 启动后先等页面正常显示，再静默检查一次
+  setTimeout(() => {
+    if (process.platform === 'win32') updater.check({ manual: false });
+  }, 20000);
+
+  clearInterval(checkTimer);
+  checkTimer = setInterval(() => {
+    if (process.platform === 'win32') updater.check({ manual: false });
+  }, everyMs);
+  checkTimer.unref?.();
+}
+
+// ------------------------------------------------ 窗口
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    minWidth: 900,
+    minHeight: 600,
+    title: 'DSH 桌面版',
+    autoHideMenuBar: false,
+    backgroundColor: '#0f1115',
+    icon: windowIconPath(),
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      spellcheck: false,
+    },
+  });
+
+  mainWindow.loadURL(PROXY_URL);
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+
+  // 关闭窗口默认最小化到托盘（可在 config.json 设 closeToTray:false 改成直接退出）
+  mainWindow.on('close', (event) => {
+    const cfg = readConfig();
+    if (!isQuitting && cfg.closeToTray !== false && tray) {
+      event.preventDefault();
+      mainWindow.hide();
+      if (!trayHintShown) {
+        trayHintShown = true;
+        try {
+          if (Notification.isSupported()) {
+            const n = new Notification({
+              title: 'DSH 桌面版仍在后台运行',
+              body: '任务完成时会在这里提醒；双击托盘图标可重新打开窗口。',
+              silent: true,
+            });
+            n.on('click', () => showWindow());
+            n.show();
+          }
+        } catch {}
+      }
+    }
+  });
+
+  // 站内链接正常打开，外部链接走系统浏览器
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http://127.0.0.1') || url.startsWith('http://localhost')) {
+      return { action: 'allow' };
+    }
+    shell.openExternal(url).catch(() => {});
+    return { action: 'deny' };
+  });
+
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    dialog.showMessageBox({ type: 'error', message: `页面进程异常退出：${details.reason}\n可以点“视图→重新加载”。` });
+  });
+}
+
+function fetchProxyStats() {
+  return new Promise((resolve, reject) => {
+    const req = http.get(`${PROXY_URL}__proxy/stats`, { timeout: 4000 }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy(new Error('请求本地代理超时'));
+    });
+  });
+}
+
+async function showProxyStats() {
+  try {
+    const stats = await fetchProxyStats();
+    const mb = (n) => `${(Number(n || 0) / 1048576).toFixed(1)} MB`;
+    const uptime = Math.max(0, Math.round((Date.now() - Number(stats.startedAt || Date.now())) / 1000));
+    const detail = [
+      `客户端版本：${app.getVersion()}      本地代理版本：${stats.version ?? '?'}`,
+      `已运行：${Math.floor(uptime / 60)} 分 ${uptime % 60} 秒      WebSocket 连接：${stats.wsConnections ?? 0}`,
+      '',
+      `接口缓存：命中 ${stats.apiHit ?? 0} 次 / 未命中 ${stats.apiMiss ?? 0} 次（新写入 ${stats.apiStored ?? 0}）`,
+      `首屏会话列表：磁盘缓存命中 ${stats.listDiskHit ?? 0} 次`,
+      `累计节省流量：${mb(stats.bytesSaved)}`,
+      '',
+      `切会话：本地快照命中 ${stats.wsSnapshotHit ?? 0} 次，自动重同步 ${stats.wsSnapshotResync ?? 0} 次，丢弃重复 ${stats.wsSnapshotDropped ?? 0} 次`,
+      `预取：${stats.prefetched ?? 0} 个会话 / 共 ${stats.prefetchPages ?? 0} 页${
+        stats.lastPrefetch ? `（上次 ${stats.lastPrefetch.sessions} 个会话，用时 ${stats.lastPrefetch.ms}ms）` : ''
+      }`,
+    ].join('\n');
+    const opts = {
+      type: 'info',
+      title: '连接 / 缓存状态',
+      message: '本地缓存代理运行状态',
+      detail,
+      buttons: ['确定'],
+      noLink: true,
+    };
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      await dialog.showMessageBox(mainWindow, opts);
+    } else {
+      await dialog.showMessageBox(opts);
+    }
+  } catch (error) {
+    dialog.showMessageBox({
+      type: 'error',
+      title: '连接 / 缓存状态',
+      message: '读取本地代理状态失败',
+      detail: String(error?.message ?? error),
+    });
+  }
+}
+
+function buildMenu() {
+  const template = [
+    {
+      label: '文件',
+      submenu: [
+        {
+          label: '打开配置目录',
+          click: () => shell.openPath(userDataDir()).catch(() => {}),
+        },
+        {
+          label: '打开日志',
+          click: () => shell.openPath(logFile()).catch(() => {}),
+        },
+        {
+          label: '打开安装目录',
+          click: () => shell.openPath(installDir()).catch(() => {}),
+        },
+        { type: 'separator' },
+        { label: '退出', role: 'quit' },
+      ],
+    },
+    {
+      label: '视图',
+      submenu: [
+        { label: '重新加载', role: 'reload' },
+        { label: '强制刷新（清空页面缓存）', role: 'forceReload' },
+        { type: 'separator' },
+        { label: '放大', role: 'zoomIn' },
+        { label: '缩小', role: 'zoomOut' },
+        { label: '恢复默认缩放', role: 'resetZoom' },
+        { type: 'separator' },
+        { label: '开发者工具', role: 'toggleDevTools' },
+      ],
+    },
+    {
+      label: '帮助',
+      submenu: [
+        {
+          label: '检查更新…',
+          click: () => {
+            if (!updater) {
+              dialog.showMessageBox({ type: 'info', message: '更新功能不可用（配置里 update.enabled=false）' });
+              return;
+            }
+            updater.check({ manual: true });
+          },
+        },
+        {
+          label: '连接 / 缓存状态…',
+          click: () => showProxyStats(),
+        },
+        {
+          label: '更新访问令牌…',
+          click: () => showTokenUpdateHelp(),
+        },
+        {
+          label: '创建桌面快捷方式',
+          click: () => ensureDesktopShortcut(),
+        },
+        { type: 'separator' },
+        {
+          label: '关于 DSH 桌面版',
+          click: () =>
+            dialog.showMessageBox({
+              type: 'info',
+              title: '关于',
+              message: 'DSH 桌面版（绿色版 · 本地缓存加速）',
+              detail: [
+                `版本：${app.getVersion()}`,
+                `安装目录：${installDir()}`,
+                `本地代理：${PROXY_URL}`,
+                '缓存目录：' + path.join(process.env.LOCALAPPDATA || userDataDir(), 'dsh-client', 'cache'),
+                '日志：' + logFile(),
+                '',
+                '绿色版：整个文件夹可以随意挪动；移动后请重新创建桌面快捷方式。',
+                '升级：「帮助 → 检查更新」，或启动后自动检测。',
+              ].join('\n'),
+            }),
+        },
+      ],
+    },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+// ------------------------------------------------ 生命周期
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+
+  app.whenReady().then(async () => {
+    app.setAppUserModelId('com.dsh.desktop');
+
+    // 启动阶段先应用「已下载待生效」的小更新包（覆盖 resources/app），然后重启进入新版本
+    try {
+      const applied = applyPendingUpdate({
+        workDir: path.join(process.env.LOCALAPPDATA || userDataDir(), 'dsh-client', 'updater'),
+        appPath: app.getAppPath(),
+        log: updateLogFile(),
+      });
+      if (applied.applied) {
+        // 先停掉旧代理并释放单实例锁，避免重启后的新实例抢不到锁/端口而直接退出
+        stopProxy();
+        try {
+          app.releaseSingleInstanceLock();
+        } catch {}
+        await new Promise((r) => setTimeout(r, 600));
+        app.relaunch();
+        app.exit(0);
+        return;
+      }
+    } catch (error) {
+      console.error('应用待生效更新失败', error);
+    }
+
+    buildMenu();
+    try {
+      migrateSecrets();
+      hardenAcl();
+    } catch (error) {
+      console.error('凭据加密/权限收紧失败', error);
+    }
+    const cfgPath = ensureConfig();
+    setupTray();
+    // 开机自启：默认开启（用户可在托盘菜单关掉；关掉后下次不会自动恢复）
+    const bootCfg = readConfig();
+    if (bootCfg.autoStart !== false) setAutostart(true);
+    const running = await proxyInfo();
+    if (running && running.version === app.getVersion()) {
+      // 端口上是同版本代理，直接复用
+    } else {
+      if (running) {
+        console.log(`端口上是旧代理 ${running.version}（当前 ${app.getVersion()}），先结束它`);
+        killStaleProxy(running.pid);
+        await new Promise((r) => setTimeout(r, 800));
+      }
+      startProxy(cfgPath);
+    }
+    const ok = await waitProxy(60000);
+    if (!ok) {
+      dialog.showErrorBox(
+        '本地缓存代理启动失败',
+        '请查看日志：\n' + logFile() + '\n\n常见原因：config.json 里的服务器地址/token 不对，或网络不通。',
+      );
+      app.quit();
+      return;
+    }
+    createWindow();
+    startNotifyWatcher();
+    // 凭据失效时提示一次
+    setInterval(() => {
+      proxyInfo().then((stats) => checkAuthState(stats)).catch(() => {});
+    }, 15000).unref?.();
+    if (process.env.DSH_NOTIFY_TEST === '1') {
+      setTimeout(() => notifyTaskDone('测试会话', 75000), 3000);
+    }
+    // 绿色版首次运行自动建桌面快捷方式（不打扰：只看是否已存在）
+    if (process.platform === 'win32') {
+      ensureDesktopShortcut({ quiet: true });
+      ensureStartMenuShortcut();
+    }
+    setupUpdater();
+  });
+
+  app.on('window-all-closed', () => {
+    if (tray) return; // 有托盘时保持后台运行
+    app.quit();
+  });
+
+  app.on('before-quit', () => {
+    isQuitting = true;
+    if (checkTimer) clearInterval(checkTimer);
+    stopNotifyWatcher();
+    stopProxy();
+  });
+}

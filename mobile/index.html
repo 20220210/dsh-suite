@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0f14">
+<title>DSH</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header id="top">
+    <button id="back" class="icon" hidden aria-label="返回">‹</button>
+    <div id="title">DSH</div>
+    <span id="ver"></span>
+    <button id="refresh" class="icon" aria-label="刷新">⟳</button>
+  </header>
+
+  <section id="view-list" class="view">
+    <div id="ptr">下拉刷新</div>
+    <div id="sessions" class="scroll"></div>
+  </section>
+
+  <section id="view-chat" class="view" hidden>
+    <button id="modelbar" type="button"><span id="modelname">模型</span> <span class="caret">▾</span></button>
+    <div id="stats"></div>
+    <div id="messages"></div>
+    <div id="pending"></div>
+    <div id="queue" hidden></div>
+    <div id="thumbs" hidden></div>
+    <form id="composer" autocomplete="off">
+      <button id="attach" type="button" aria-label="发送图片">＋</button>
+      <button id="attachfile" type="button" aria-label="发送文件">📎</button>
+      <textarea id="input" rows="1" placeholder="发消息…" enterkeyhint="send"></textarea>
+      <button id="mode" type="button" title="发送方式">排队</button>
+      <button id="stop" type="button" hidden>停止</button>
+    </form>
+  </section>
+
+  <div id="modelsheet" hidden>
+    <div class="sheet-mask"></div>
+    <div class="sheet">
+      <div class="sheet-head"><span>选择模型</span><button id="sheet-close">关闭</button></div>
+      <div id="model-list"></div>
+    </div>
+  </div>
+  <div id="gate" hidden>
+    <div class="gate-box">
+      <div class="gate-title">需要登录</div>
+      <div class="gate-text" id="gate-text">请输入访问密码</div>
+      <button id="gate-btn">登录</button>
+    </div>
+  </div>
+  <div id="toast" hidden></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

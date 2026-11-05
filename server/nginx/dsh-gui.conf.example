@@ -1,0 +1,157 @@
+# DSH Web GUI 的公网 HTTPS 入口（只走 nginx 反代，不占用 ssh）
+# 访问: https://dsh.example.com:19306/  需要 Basic Auth 密码 + DSH token
+server {
+    listen 19306 ssl http2;
+    listen [::]:19306 ssl http2;
+    server_name dsh.example.com;
+
+    ssl_certificate     /etc/nginx/ssl/dsh.example.com.crt;
+    ssl_certificate_key /etc/nginx/ssl/dsh.example.com.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:DSHGUISSL:2m;
+
+    # 不记录访问日志：URL 里带 token，避免落盘（诊断已结束）
+    access_log off;
+
+    # 附件/大文件上传
+    client_max_body_size 500m;
+
+    # 第一层：Basic Auth（nginx 层）；外加 bridge 签发的 dshm cookie
+    # iOS PWA 存不住 BasicAuth（切屏/重连都会重新弹框），所以输过一次之后改用 cookie 认证。
+    auth_basic "DSH";
+    auth_basic_user_file /etc/nginx/dsh-gui.htpasswd;
+
+    # 子请求：bridge 校验 dshm cookie，2xx 视为通过
+    location = /dshm-check {
+        internal;
+        auth_basic off;
+        proxy_pass http://127.0.0.1:19391/pauth;
+        proxy_set_header Cookie $http_cookie;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+    }
+
+    # 桌面客户端自动获取 DSH 当前进程 token（受 BasicAuth 保护；DSH 重启会换 token）
+    # 手机一键登录：输入 BasicAuth 后自动换 token 并跳进 DSH（DSH 重启换 token 也能用）
+    location = /_dsh/auto {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:19391/auto;
+        proxy_set_header Host 127.0.0.1:19391;
+        add_header Cache-Control "no-store";
+    }
+
+    location = /_dsh/token {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:19391/token;
+        proxy_set_header Host 127.0.0.1:19391;
+        proxy_set_header X-Real-IP $remote_addr;
+        add_header Cache-Control "no-store";
+    }
+
+    # 移动端登录跳板：/m/login?token=xxx -> 代理到 DSH 的 /?token=xxx
+    # DSH 会 Set-Cookie 并 303 到 "./"，浏览器相对原 URL 解析 -> 回到 /m/
+    location = /m/login {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:3080/;
+        proxy_set_header Host 127.0.0.1:3080;
+        proxy_set_header Origin http://127.0.0.1:3080;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # 移动端 PWA（自建，静态文件；与 DSH 同源，复用 dsh-auth cookie）
+    location /m/ {
+        # 静态外壳（无任何秘密），不需要认证 —— 否则手机上缓存的旧 BasicAuth 会直接 401 白屏
+        auth_basic off;
+        alias /var/www/dsh-mobile/;
+        index index.html;
+        try_files $uri $uri/ /m/index.html;
+        add_header Cache-Control "no-store";
+    }
+
+    # 客户端安装包下载（同样受 Basic Auth 保护）
+    location /downloads/ {
+        alias /var/www/dsh-downloads/;
+        autoindex off;
+        add_header Cache-Control "no-store";
+    }
+
+    # 前端静态资源（文件名带 hash，可长期缓存，避免每次打开重下 500KB+）
+    location /assets/ {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Host 127.0.0.1:3080;
+        proxy_set_header Origin http://127.0.0.1:3080;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering on;
+        expires 30d;
+    }
+
+    # 浏览器的 WebSocket 握手不会带 BasicAuth 缓存（Safari/桌面壳都一样），
+    # 在 WS 路径上放开 nginx 的 Basic 认证——DSH 自己仍要求 dsh-auth cookie，
+    # 没有 cookie 的握手会被 DSH 401 拒绝。
+    location = /api/remote.mux {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host 127.0.0.1:3080;
+        proxy_set_header Origin http://127.0.0.1:3080;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # 手机直接访问根路径 -> 移动版（电脑不受影响；带 ?token= 的链接不跳）
+    location = / {
+        if ($dsh_mobile_root = 1) {
+            return 302 /m/;
+        }
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host 127.0.0.1:3080;
+        proxy_set_header Origin http://127.0.0.1:3080;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_socket_keepalive on;
+    }
+
+    location / {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+
+        # WebSocket
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # DSH 只信任 127.0.0.1 / bind 地址：这里把 Host/Origin 改写成它认识的本地源
+        proxy_set_header Host 127.0.0.1:3080;
+        proxy_set_header Origin http://127.0.0.1:3080;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        # 流式/长连接：不缓冲、不超时
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_socket_keepalive on;
+    }
+}

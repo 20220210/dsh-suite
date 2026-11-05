@@ -1,0 +1,25 @@
+# 真实配置（含密码/token）
+client/default-config.json
+client/config.json
+*.local.json
+.env
+.env.*
+
+# 凭据与密钥
+*.pem
+*.key
+*.crt
+*dsh-auth*
+bridge-secret
+.credentials.yaml
+htpasswd
+
+# 备份/构建产物
+*.bak
+*.bak.*
+node_modules/
+dist/
+build/
+*.zip
+*.log
+.DS_Store
