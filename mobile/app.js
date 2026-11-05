@@ -17,7 +17,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '91';   // 部署时由脚本替换成时间戳
+const BUILD = '120';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -27,7 +27,7 @@ const el = (tag, cls, txt) => { const n = document.createElement(tag); if (cls) 
 const rid = () => 'w-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 const nowTZ = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
-const state = { workspaces: [], archived: new Set(), view: 'list', sessions: [], sessionId: null, clientId: null, pending: new Map(), ws: null, followWs: null, live: null, running: false, mode: 'queue', images: [], files: [], toolCount: 0, shownRpc: new Set(), queue: [], thinkRow: null, thinkPhase: 'thinking', toolLabel: '', catalog: null, model: null, stats: null, turnStart: null, turnSteps: 0, ticker: null, followRetry: 0, wsRetry: 0, connState: 'ok' };
+const state = { workspaces: [], expandedGroups: new Set(), pinned: new Set(), archived: new Set(), view: 'list', sessions: [], sessionId: null, clientId: null, pending: new Map(), ws: null, followWs: null, live: null, running: false, mode: 'steer', images: [], files: [], toolCount: 0, toolRow: null, shownRpc: new Set(), queue: [], thinkRow: null, thinkPhase: 'thinking', toolLabel: '', catalog: null, model: null, stats: null, turnStart: null, turnSteps: 0, ticker: null, followRetry: 0, wsRetry: 0, connState: 'ok' };
 
 function toast(msg, ms = 2600) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
@@ -118,6 +118,10 @@ function openWorkspaceStream() {
       state.archived = new Set(payload.archivedSessionIds);
       changed = true;
     }
+    if (Array.isArray(payload.pinnedSessionIds)) {
+      state.pinned = new Set(payload.pinnedSessionIds);
+      changed = true;
+    }
     if (changed) {
       if (state.archivedReady) state.archivedReady();
       if (state.view === 'list') loadSessions().catch(() => {});
@@ -148,12 +152,30 @@ async function loadSessions() {
   const rest = items.filter((it) => !used.has(it.sessionId));
   if (rest.length) groups.push({ title: '未分组', path: '', list: rest });
 
+  const LIMIT = 4;
   for (const g of groups) {
+    g.list.sort((a, b) =>
+      ((state.pinned.has(b.sessionId) ? 1 : 0) - (state.pinned.has(a.sessionId) ? 1 : 0)) ||
+      ((b.running === true) - (a.running === true)) ||
+      ((b.updatedAt || 0) - (a.updatedAt || 0)));
+    const key = (g.path || g.title) + '';
+    const expanded = state.expandedGroups.has(key);
     const h = el('div', 'ws-group');
     h.append(el('span', 'ws-title', g.title));
     if (g.path) h.append(el('span', 'ws-path', g.path));
     box.append(h);
-    for (const it of g.list) box.append(buildRow(it));
+    const shown = expanded ? g.list : g.list.slice(0, LIMIT);
+    for (const it of shown) box.append(buildRow(it));
+    if (g.list.length > LIMIT) {
+      const more = el('button', 'ws-more');
+      const rest = g.list.length - LIMIT;
+      more.textContent = expanded ? '收起 ⌃' : ('展开剩余 ' + rest + ' 个 ⌄');
+      more.onclick = () => {
+        if (expanded) state.expandedGroups.delete(key); else state.expandedGroups.add(key);
+        loadSessions().catch(() => {});
+      };
+      box.append(more);
+    }
   }
   return;
 }
@@ -162,13 +184,17 @@ function buildRow(it) {
   {
     const v = it.projections?.values || {};
     const row = el('div', 'row');
-    row.append(el('div', 't', v.title || (it.blank ? '（空白会话）' : it.sessionId.slice(8, 16))));
-    const meta = el('div', 'm');
-    meta.append(el('span', null, it.cwd ? it.cwd.split('/').slice(-2).join('/') : ''),
-      el('span', null, fmtTime(it.updatedAt || Date.now())));
-    if (it.running) meta.append(el('span', 'badge run', '运行中'));
-    if (v.sessionStats?.turns) meta.append(el('span', 'badge', v.sessionStats.turns + ' 轮'));
-    row.append(meta);
+    const info = el('div', 'row-info');
+    const isPinned = state.pinned.has(it.sessionId);
+    const titleLine = el('div', 't');
+    if (isPinned) titleLine.append(el('span', 'pin', '📌'));
+    titleLine.append(document.createTextNode(v.title || (it.blank ? '（空白会话）' : it.sessionId.slice(8, 16))));
+    info.append(titleLine);
+    row.append(info);
+    if (it.running) row.append(el('span', 'badge run', '运行中'));
+    const more = el('button', 'row-more', '⋯');
+    more.onclick = (e) => { e.stopPropagation(); openRowMenu(it); };
+    row.append(more);
     row.onclick = () => openSession(it);
     return row;
   }
@@ -319,9 +345,11 @@ async function openSession(it) {
   const v = it.projections?.values || {};
   $('#title').textContent = v.title || it.sessionId.slice(8, 16);
   showView('chat');
+  updateJumpBtn();
   $('#messages').replaceChildren(el('div', 'empty', '加载中…'));
   state.view = 'chat';
-  state.live = null; setRunning(false);
+  clearLiveBubbles(); setRunning(false); clearThinkLine();
+  const tk = $('#tasks'); if (tk) { tk.replaceChildren(); tk.hidden = true; }
   state.shownRpc = new Set();
   state.model = v.modelSelection?.next || v.modelSelection?.lastUsed || null;
   state.stats = null;
@@ -339,6 +367,11 @@ async function openSession(it) {
     if (state.stats.contextPct !== null) renderStats();
   }
   renderModelBar(); renderStats(); startTicker();
+  if (Array.isArray(v.todos)) renderTasks(v.todos);
+  state.goal = v.goal?.goal || v.goal || null;
+  renderGoal();
+  // 让 iOS 侧滑返回 / 安卓返回键能回到列表
+  if (history.state?.dshView !== 'chat') history.pushState({ dshView: 'chat', sessionId: it.sessionId }, '');
   await openEvents();            // 审批流（全局长连）
   openFollow(it.sessionId);      // 对话流
 }
@@ -418,7 +451,12 @@ function renderRecord(rec, box) {
         if (state.shownRpc.has(src.rpcId)) break;   // 已本地显示过
       }
       const txt = textOf(d.content);
-      if (txt) box.append(el('div', 'msg user', txt));
+      if (txt) {
+        const b = el('div', 'msg user');
+        b.append(document.createTextNode(txt));
+        b.append(makeFoot({ text: txt, time: e.time }));
+        box.append(b);
+      }
       break;
     }
     case 'assistant/message': {
@@ -427,21 +465,62 @@ function renderRecord(rec, box) {
       const think = content.filter((p) => p?.type === 'reasoning').map((p) => p.text).join('\n');
       const txt = textOf(content);
       if (!txt && !think) break;
-      if (think && (!state.thinkRow || state.thinkRow.streamed === 0)) appendThink(think);   // 流式已写过的不要重复
+      if (think && state.turnStart) {
+        if (!state.thinkRow || state.thinkRow.streamed === 0) appendThink(think);
+      } else if (think && !state.turnStart) {
+        const det = document.createElement('details');
+        det.className = 'think turn-think';
+        const sum = document.createElement('summary');
+        sum.textContent = '已完成 · ' + think.length + ' 字 ⌄';
+        const body = el('div', 'think-body', think.slice(0, 60000));
+        det.append(sum, body);
+        box.append(det);
+      }
       if (!txt) break;
-      const bubble = el('div', 'msg bot');
-      bubble.append(document.createTextNode(txt));
+      const bubble = el('div', 'msg bot md');
+      bubble.innerHTML = mdToHtml(txt);
+      bubble.append(makeFoot({
+        text: txt,
+        usage: d.usage?.totalTokens,
+        seq: e.seq,
+        messageId: d.message?.id,
+        time: e.time,
+      }));
       box.append(bubble);
       break;
     }
     case 'step/start': state.turnSteps++; state.thinkPhase = 'thinking'; state.toolLabel = ''; break;
     case 'tool/call': {
       state.toolCount = (state.toolCount || 0) + 1;
+      if (['create_goal', 'update_goal', 'get_goal'].includes(d.name)) setTimeout(() => refreshGoal().catch(() => {}), 600);
+      if (d.name === 'todo_write') {
+        try {
+          const args = JSON.parse(d.arguments || '{}');
+          if (Array.isArray(args.todos)) renderTasks(args.todos);
+        } catch {}
+      }
       state.thinkPhase = 'tool';
       let desc = '';
       try { desc = (JSON.parse(d.arguments || '{}').description || '').slice(0, 30); } catch {}
       const label = TOOL_LABELS[d.name] || d.name || '工具';
       state.toolLabel = desc ? (label + '：' + desc) : label;
+      // 一次回合里只保留一条“工具调用”折叠行，避免一屏横条
+      if (!state.toolRow) {
+        const det = document.createElement('details');
+        det.className = 'tool-row';
+        const sum = document.createElement('summary');
+        sum.textContent = '⚙ 工具调用 0 次 ⌄';
+        const list = el('div', 'tool-list');
+        det.append(sum, list);
+        // 紧跟在动态状态行后面
+        if (state.thinkRow?.el?.parentNode === box) state.thinkRow.el.after(det);
+        else box.append(det);
+        state.toolRow = { el: det, sum, list, count: 0 };
+      }
+      state.toolRow.count += 1;
+      state.toolRow.sum.textContent = '⚙ 工具调用 ' + state.toolRow.count + ' 次 ⌄';
+      state.toolRow.list.append(el('div', 'tool-line', state.toolLabel));
+      scrollBottom();
       renderThinkSummary();
       renderStats();
       break;
@@ -450,10 +529,12 @@ function renderRecord(rec, box) {
     case 'approval/decided': box.append(el('div', 'msg sys', '授权结果：' + (d.outcome || ''))); break;
     case 'turn/start': {
       setRunning(true);
+      state.thinkRow = null;
       state.turnStart = e.time || Date.now();
       state.turnSteps = 0;
       state.toolCount = 0;
       state.thinkStart = e.time || Date.now();
+      state.toolRow = null;
       state.thinkPhase = 'thinking';
       state.toolLabel = '';
       state.thinkRow = makeThinkRow(box);
@@ -463,6 +544,7 @@ function renderRecord(rec, box) {
     }
     case 'turn/end': {
       setRunning(false);
+      clearLiveBubbles();   // 跑完就别留闪动的光标记号
       if (state.turnStart) {
         const dur = (e.time || Date.now()) - state.turnStart;
         box.append(el('div', 'msg sys', `本轮用时 ${fmtDur(dur)}`));
@@ -471,15 +553,16 @@ function renderRecord(rec, box) {
       }
       if (state.thinkRow) {
         const r = state.thinkRow;
+        const secs = Math.max(1, Math.round(((e.time || Date.now()) - (state.thinkStart || 0)) / 1000));
         if (r.chars > 0) {
-          const secs = Math.max(1, Math.round(((e.time || Date.now()) - (state.thinkStart || 0)) / 1000));
-          r.summary.textContent = `已完成，用时 ${secs} 秒 · ${r.chars} 字`;
+          r.summary.textContent = `已完成，用时 ${secs} 秒 ⌄`;
         } else {
           r.el.remove();
         }
         r.el.open = false;
         state.thinkRow = null;
       }
+      refreshGoal().catch(() => {});
       const err = d.reason?.error?.message;
       if (err) box.append(el('div', 'msg sys', '出错：' + err));
       break;
@@ -488,40 +571,50 @@ function renderRecord(rec, box) {
   }
 }
 
+function clearLiveBubbles() {
+  document.querySelectorAll('#messages .msg.live').forEach((n) => n.remove());
+  state.live = null;
+}
+
 function onAssistantStream(frame) {
   if (!frame) return;
   if (frame.type === 'start') {
-    const bubble = el('div', 'msg bot live');
-    bubble.dataset.attempt = frame.attemptId || '';
-    const think = el('div', 'think-live'); think.hidden = true;
-    const text = el('div', 'live-text');
-    bubble.append(think, text);
-    $('#messages').append(bubble);
-    state.live = { attemptId: frame.attemptId, bubble, think, text, thinkChars: 0, thinking: false };
-    if (!state.thinkStart) state.thinkStart = Date.now();
-    scrollBottom(true);
+    clearLiveBubbles();
+    // 先不建气泡：模型可能只想很久不出字，空气泡+光标看着像 bug
+    state.live = { attemptId: frame.attemptId, bubble: null };
     return;
   }
   if (!state.live || state.live.attemptId !== frame.attemptId) return;
+
   if (frame.type === 'chunk') {
     const c = frame.chunk || {};
     if (c.type === 'text-delta' && c.text) {
-      if (state.live.thinking) { state.live.think.hidden = true; state.live.thinking = false; }
-      state.live.text.append(document.createTextNode(c.text));
+      if (!state.live.bubble) {
+        const b = el('div', 'msg bot live');
+        state.live.bubble = b;
+        $('#messages').append(b);
+      }
+      state.live.bubble.append(document.createTextNode(c.text));
       scrollBottom();
     } else if (c.type === 'reasoning-delta' && c.text) {
-      if (!state.thinkRow) state.thinkRow = makeThinkRow($('#messages'));
+      if (!state.thinkRow) state.thinkRow = makeThinkRow();
       state.thinkRow.streamed += c.text.length;
       appendThink(c.text);
-      if (!state.live.thinking) { state.live.thinking = true; state.live.think.hidden = false; }
-      state.live.think.textContent = '思考中…';
     }
     return;
   }
+
   if (frame.type === 'end') {
     if (state.live.bubble) state.live.bubble.classList.remove('live');
-    return;
   }
+}
+
+function updateJumpBtn() {
+  const m = $('#messages'), b = $('#jumpbtn');
+  if (!m || !b) return;
+  const away = m.scrollHeight - m.scrollTop - m.clientHeight;
+  const show = state.view === 'chat' && away > 200;
+  if (b.hidden !== !show) b.hidden = !show;
 }
 
 function scrollBottom(force) {
@@ -546,16 +639,370 @@ async function stopRun() {
   try { await rpc('session/cancel', { request: { sessionId: state.sessionId } }); toast('已请求停止', 2000); }
   catch (e) { toast('停止失败：' + e.message, 4000); }
 }
-function bindMode() {
-  const btn = $('#mode'); if (!btn) return;
-  btn.textContent = state.mode === 'steer' ? '插话' : '排队';
-  btn.classList.toggle('steer', state.mode === 'steer');
-  btn.onclick = () => {
-    state.mode = state.mode === 'steer' ? 'queue' : 'steer';
-    btn.textContent = state.mode === 'steer' ? '插话' : '排队';
-    btn.classList.toggle('steer', state.mode === 'steer');
-    toast(state.mode === 'steer' ? '插话模式：这条会直接插进当前回合' : '排队模式：等这一轮跑完再发', 2200);
+
+
+function fmtTokens(n) {
+  if (!n) return '';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1000) return Math.round(n / 1000) + 'K';
+  return String(n);
+}
+function fmtClock(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+function makeFoot({ text, usage, seq, messageId, time }) {
+  const foot = el('div', 'msg-foot');
+  const copy = el('button', 'act', '⧉');
+  copy.title = '复制';
+  copy.onclick = async (e) => {
+    e.stopPropagation();
+    try { await navigator.clipboard.writeText(text || ''); toast('已复制', 1200); }
+    catch { toast('复制失败', 2000); }
   };
+  foot.append(copy);
+  if (messageId) {
+    const up = el('button', 'act', '👍');
+    const down = el('button', 'act', '👎');
+    const vote = async (rating, btn) => {
+      btn.classList.add('on');
+      try {
+        await rpc('messageFeedback/put', { request: { sessionId: state.sessionId, messageId, rating, ifVersion: null } });
+        toast(rating === 'positive' ? '已好评' : '已差评', 1500);
+      } catch (err) {
+        btn.classList.remove('on');
+        toast('反馈失败：' + err.message, 3000);
+      }
+    };
+    up.onclick = (e) => { e.stopPropagation(); vote('positive', up); };
+    down.onclick = (e) => { e.stopPropagation(); vote('negative', down); };
+    foot.append(up, down);
+    const fork = el('button', 'act', '⑂');
+    fork.title = '从这里分叉会话';
+    fork.onclick = async (e) => {
+      e.stopPropagation();
+      if (!seq) { toast('这条消息不支持分叉', 2000); return; }
+      try {
+        const v = await rpc('session/fork', { request: { sessionId: state.sessionId, atSeq: seq } });
+        toast('已创建分支会话', 2200);
+        const sid = v?.sessionId || v?.id;
+        await loadSessions().catch(() => {});
+        if (sid) { const item = state.sessions.find((x) => x.sessionId === sid); if (item) openSession(item); }
+      } catch (err) { toast('分叉失败：' + err.message, 3000); }
+    };
+    foot.append(fork);
+  }
+  if (usage) foot.append(el('span', 'usage', '用量 ' + fmtTokens(usage) + ' tok'));
+  if (time) foot.append(el('span', 'time', fmtClock(time)));
+  return foot;
+}
+
+
+/* ---------- 轻量 Markdown 渲染（先转义再拼标签，防注入） ---------- */
+function escHtml(x) {
+  return String(x).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function mdInline(x) {
+  let t = escHtml(x);
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  t = t.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  t = t.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
+  return t;
+}
+function mdToHtml(src) {
+  const text = String(src || '').replace(/\r\n/g, '\n');
+  const blocks = [];
+  // 先抽出围栏代码块，避免内部内容被当 Markdown
+  const staged = text.replace(/```([\w+#.-]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+    blocks.push({ lang: (lang || '').trim(), code: code.replace(/\n$/, '') });
+    return '\u0000CODE' + (blocks.length - 1) + '\u0000';
+  });
+  const lines = staged.split('\n');
+  const out = [];
+  let i = 0;
+  let listType = null;
+  const closeList = () => { if (listType) { out.push('</' + listType + '>'); listType = null; } };
+
+  const isTableSep = (ln) => /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$/.test(ln.trim());
+  const splitRow = (ln) => ln.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+
+  while (i < lines.length) {
+    let ln = lines[i];
+
+    // 代码块占位
+    const mCode = ln.match(/^\u0000CODE(\d+)\u0000$/);
+    if (mCode) {
+      closeList();
+      const b = blocks[Number(mCode[1])];
+      out.push('<pre><code>' + escHtml(b.code) + '</code></pre>');
+      i += 1;
+      continue;
+    }
+
+    if (!ln.trim()) { closeList(); i += 1; continue; }
+
+    // 表格：当前行像表头且下一行是分隔行
+    if (ln.trim().startsWith('|') && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      closeList();
+      const head = splitRow(ln);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith('|')) { rows.push(splitRow(lines[i])); i += 1; }
+      let html = '<div class="tbl"><table><thead><tr>' + head.map((c) => '<th>' + mdInline(c) + '</th>').join('') + '</tr></thead><tbody>';
+      for (const r of rows) html += '<tr>' + r.map((c) => '<td>' + mdInline(c) + '</td>').join('') + '</tr>';
+      html += '</tbody></table></div>';
+      out.push(html);
+      continue;
+    }
+
+    // 标题
+    let m = ln.match(/^(#{1,6})\s+(.*)$/);
+    if (m) { closeList(); const lv = Math.min(m[1].length + 2, 6); out.push('<h' + lv + '>' + mdInline(m[2]) + '</h' + lv + '>'); i += 1; continue; }
+
+    // 分隔线
+    if (/^\s*([-*_])\s*(\1\s*){2,}$/.test(ln)) { closeList(); out.push('<hr>'); i += 1; continue; }
+
+    // 引用
+    if (/^\s*>\s?/.test(ln)) {
+      closeList();
+      const buf = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) { buf.push(lines[i].replace(/^\s*>\s?/, '')); i += 1; }
+      out.push('<blockquote>' + mdInline(buf.join(' ')) + '</blockquote>');
+      continue;
+    }
+
+    // 列表
+    m = ln.match(/^(\s*)([-*+]|\d+[.)])\s+(.*)$/);
+    if (m) {
+      const want = /\d/.test(m[2]) ? 'ol' : 'ul';
+      if (listType !== want) { closeList(); out.push('<' + want + '>'); listType = want; }
+      out.push('<li>' + mdInline(m[3]) + '</li>');
+      i += 1;
+      continue;
+    }
+
+    // 普通段落（连续行合并）
+    closeList();
+    const para = [ln];
+    i += 1;
+    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|```|\u0000CODE|>\s?|\s*([-*+]|\d+[.)])\s+)/.test(lines[i]) && !(lines[i].trim().startsWith('|') && i + 1 < lines.length && isTableSep(lines[i + 1]))) {
+      para.push(lines[i]); i += 1;
+    }
+    out.push('<p>' + mdInline(para.join('\n')).replace(/\n/g, '<br>') + '</p>');
+  }
+  closeList();
+  return out.join('\n');
+}
+
+/* ---------- 会话行操作（置顶 / 归档 / 重命名） ---------- */
+function openRowMenu(it) {
+  const sheet = $('#rowmenu'); const list = $('#row-list');
+  if (!sheet || !list) return;
+  $('#rowmenu-title').textContent = (it.projections?.values?.title || '会话') + '';
+  list.replaceChildren();
+  const pinned = state.pinned.has(it.sessionId);
+
+  const mk = (icon, label, onclick, danger) => {
+    const b = el('button', 'row-act' + (danger ? ' danger' : ''));
+    b.append(el('span', 'ri', icon), el('span', 'rl', label));
+    b.onclick = () => { sheet.hidden = true; onclick(); };
+    return b;
+  };
+
+  list.append(mk('📌', pinned ? '取消置顶' : '置顶会话', async () => {
+    try {
+      await rpc(pinned ? 'workspace/unpinSession' : 'workspace/pinSession', { request: { sessionId: it.sessionId } });
+      if (pinned) state.pinned.delete(it.sessionId); else state.pinned.add(it.sessionId);
+      toast(pinned ? '已取消置顶' : '已置顶', 1600);
+      await loadSessions();
+    } catch (e) { toast('操作失败：' + e.message, 3500); }
+  }));
+
+  list.append(mk('✏️', '重命名', () => {
+    // iOS 独立模式不支持 prompt()，改成面板内输入
+    const cur = it.projections?.values?.title || '';
+    list.replaceChildren();
+    const row2 = el('div', 'gnew');
+    const inp = el('input'); inp.value = cur; inp.placeholder = '新的会话标题';
+    const save = el('button', null, '保存');
+    const doRename = async () => {
+      const title = inp.value.trim();
+      if (!title || title === cur) { sheet.hidden = true; return; }
+      try {
+        await rpc('session/rename', { request: { sessionId: it.sessionId, title } });
+        sheet.hidden = true;
+        toast('已重命名', 1600);
+        await loadSessions();
+      } catch (e) { toast('重命名失败：' + e.message, 3500); }
+    };
+    save.onclick = doRename;
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doRename(); } });
+    row2.append(inp, save);
+    list.append(row2);
+    setTimeout(() => inp.focus(), 100);
+  }));
+
+  list.append(mk('🗄', '归档会话', async () => {
+    try {
+      await rpc('workspace/archiveSession', { request: { sessionId: it.sessionId, stopActivity: true } });
+      state.archived.add(it.sessionId);
+      toast('已归档', 1600);
+      await loadSessions();
+    } catch (e) { toast('归档失败：' + e.message, 3500); }
+  }, true));
+
+  sheet.hidden = false;
+}
+
+/* ---------- 加号菜单（对齐电脑端：添加 / 指令） ---------- */
+function plusRow(icon, title, desc, onclick) {
+  const row = el('button', 'plus-row');
+  row.append(el('span', 'pi', icon), el('span', 'pt', title));
+  if (desc) row.append(el('span', 'pd', desc));
+  row.onclick = () => { $('#plusmenu').hidden = true; onclick(); };
+  return row;
+}
+
+function openPlusMenu() {
+  const box = $('#plus-list'); if (!box) return;
+  box.replaceChildren();
+  box.append(el('div', 'plus-sec', '添加'));
+  box.append(plusRow('📄', '文件', '任意文件，上传后随消息发送', () => pickFileOnce({ multiple: true, onPick: pickFiles })));
+  box.append(plusRow('🎯', '目标', '设置或查看长期任务目标', () => openGoalSheet()));
+  box.append(el('div', 'plus-sec', '指令'));
+  box.append(plusRow('⚙', '模型', '选择本会话使用的模型', () => openModelSheet().catch(() => {})));
+  $('#plusmenu').hidden = false;
+}
+
+/* ---------- 目标（goals） ---------- */
+const PHASE_TEXT = { active: '进行中', paused: '已暂停', blocked: '受阻', complete: '已完成' };
+
+function renderGoal() {
+  const bar = $('#goalbar'); if (!bar) return;
+  const g = state.goal;
+  if (!g) { bar.hidden = true; bar.replaceChildren(); return; }
+  bar.hidden = false;
+  bar.replaceChildren();
+  bar.append(el('span', null, '🎯'), el('span', 'gobj', g.objective || '（目标）'),
+    el('span', 'gphase', PHASE_TEXT[g.phase] || g.phase || ''));
+
+  const quick = el('div', 'gquick');
+  if (g.phase === 'active') {
+    const p = el('button', null, '暂停');
+    p.onclick = (e) => { e.stopPropagation(); goalAction('pause'); };
+    quick.append(p);
+  } else if (g.phase === 'paused') {
+    const r = el('button', null, '继续');
+    r.onclick = (e) => { e.stopPropagation(); goalAction('resume'); };
+    quick.append(r);
+  }
+  const ed = el('button', null, '编辑');
+  ed.onclick = (e) => { e.stopPropagation(); openGoalSheet(true); };
+  quick.append(ed);
+  bar.append(quick);
+}
+
+async function refreshGoal() {
+  if (!state.sessionId) return;
+  try {
+    const v = await rpc('goals/get', { agentId: state.sessionId });
+    state.goal = v || null;
+  } catch { state.goal = null; }
+  renderGoal();
+}
+
+async function goalAction(kind) {
+  const g = state.goal; if (!g?.id) return;
+  const args = { agentId: state.sessionId, ref: { id: g.id, revision: g.revision } };
+  try {
+    await rpc('goals/' + kind, args);
+    toast('目标已' + ({ pause: '暂停', resume: '继续', complete: '完成', clear: '清除' }[kind] || kind), 1800);
+    await refreshGoal();
+    if ($('#goalsheet').hidden === false) openGoalSheet();
+  } catch (e) { toast('操作失败：' + e.message, 4000); }
+}
+
+async function editGoal(objective) {
+  const g = state.goal; if (!g?.id || !objective?.trim()) return;
+  try {
+    await rpc('goals/edit', { agentId: state.sessionId, ref: { id: g.id, revision: g.revision }, request: { objective: objective.trim() } });
+    toast('目标已更新', 1800);
+    await refreshGoal();
+    openGoalSheet();
+  } catch (e) { toast('修改失败：' + e.message, 4000); }
+}
+
+async function createGoal(objective) {
+  if (!objective || !objective.trim()) return;
+  try {
+    await rpc('goals/create', { agentId: state.sessionId, request: { objective: objective.trim() } });
+    toast('目标已创建', 2000);
+    await refreshGoal();
+    openGoalSheet();
+  } catch (e) { toast('创建失败：' + e.message, 4000); }
+}
+
+function openGoalSheet(editMode) {
+  const sheet = $('#goalsheet'); const body = $('#goal-body');
+  if (!sheet || !body) return;
+  sheet.hidden = false;
+  body.replaceChildren();
+  const g = state.goal;
+  if (g) {
+    body.append(el('div', 'gobj', g.objective || '（目标）'));
+    body.append(el('div', 'gmeta',
+      `状态：${PHASE_TEXT[g.phase] || g.phase} · 已进行 ${g.roundsStarted ?? 0}/${g.maxGoalRounds ?? '?'} 轮` +
+      (g.phase === 'blocked' && g.blockedReason ? ` · 受阻原因：${g.blockedReason.message}` : '')));
+    const btns = el('div', 'gbtns');
+    if (g.phase === 'active') {
+      const p = el('button', null, '暂停'); p.onclick = () => goalAction('pause'); btns.append(p);
+      const c = el('button', 'primary', '标记完成'); c.onclick = () => goalAction('complete'); btns.append(c);
+    } else if (g.phase === 'paused') {
+      const r = el('button', 'primary', '继续'); r.onclick = () => goalAction('resume'); btns.append(r);
+    } else if (g.phase === 'complete') {
+      const cl = el('button', null, '清除目标'); cl.onclick = () => goalAction('clear'); btns.append(cl);
+    }
+    if (btns.children.length) body.append(btns);
+  }
+  const editing = !!(editMode && g);
+  body.append(el('div', 'ghint', editing ? '修改目标内容：' : (g ? '创建新目标会替换当前目标：' : '当前没有目标，可以创建一个：')));
+  const row = el('div', 'gnew');
+  const inp = el('input');
+  inp.placeholder = '目标内容，例如：完成手机端目标面板';
+  if (editing) inp.value = g.objective || '';
+  const btn = el('button', null, editing ? '保存' : '创建');
+  btn.onclick = () => (editing ? editGoal(inp.value) : createGoal(inp.value));
+  inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); (editing ? editGoal : createGoal)(inp.value); } });
+  row.append(inp, btn);
+  body.append(row);
+}
+
+/* ---------- 目标任务（todo_write） ---------- */
+const TASK_ICON = { completed: '✅', in_progress: '🔄', pending: '⬜', cancelled: '✖️' };
+
+function renderTasks(todos) {
+  const box = $('#tasks'); if (!box) return;
+  box.replaceChildren();
+  if (!todos || !todos.length) { box.hidden = true; return; }
+  box.hidden = false;
+  const done = todos.filter((t) => t.status === 'completed').length;
+  const det = document.createElement('details');
+  det.className = 'tasks';
+  const sum = document.createElement('summary');
+  sum.textContent = `目标任务 ${done}/${todos.length} 完成 ⌄`;
+  det.append(sum);
+  const ul = el('div', 'task-list');
+  for (const t of todos) {
+    const row = el('div', 'task-row');
+    row.append(el('span', 'ti', TASK_ICON[t.status] || '⬜'), el('span', 'tx', t.content || ''));
+    ul.append(row);
+  }
+  det.append(ul);
+  box.append(det);
 }
 
 /* ---------- 思考行（一个回合一条，持续写入） ---------- */
@@ -572,27 +1019,34 @@ function renderThinkSummary() {
   }
 }
 
-function makeThinkRow(box) {
+function makeThinkRow() {
+  const box = $('#messages');
+  if (!box) return null;
   const det = document.createElement('details');
-  det.className = 'think';
+  det.className = 'think turn-think';
   const summary = document.createElement('summary');
-  summary.textContent = '思考中…';
+  summary.textContent = '深度求索中…';
   const body = el('div', 'think-body');
   det.append(summary, body);
   box.append(det);
-  scrollBottom();
+  scrollBottom(true);
   return { el: det, summary, body, chars: 0, streamed: 0 };
+}
+
+function clearThinkLine() {
+  state.thinkRow = null;
+  const box = $('#thinkline');
+  if (box) { box.replaceChildren(); box.hidden = true; }
 }
 
 function appendThink(text) {
   if (!text) return;
-  if (!state.thinkRow) state.thinkRow = makeThinkRow($('#messages'));
+  if (!state.thinkRow) state.thinkRow = makeThinkRow();
   const r = state.thinkRow;
   r.chars += text.length;
-  if (r.body.textContent.length < 60000) {
-    r.body.append(document.createTextNode(r.body.textContent ? '\n\n' + text : text));
-  }
+  if (r.body.textContent.length < 60000) r.body.append(document.createTextNode(text));
   renderThinkSummary();
+  if (r.el.open) r.body.scrollTop = r.body.scrollHeight;
   if (r.el.open) scrollBottom();
 }
 
@@ -605,6 +1059,21 @@ function renderQueue() {
   state.queue.forEach((item, i) => {
     const row = el('div', 'qitem');
     row.append(el('span', 'tag', '排队中'), el('span', 't', item.text || '（消息）'));
+    if (item.itemId) {
+      const jump = el('button', 'steer', '插队');
+      jump.onclick = async () => {
+        jump.disabled = true;
+        try {
+          await rpc('session/updateQueue', { request: { sessionId: state.sessionId, itemId: item.itemId, action: { kind: 'steer' } } });
+          state.queue.splice(i, 1); renderQueue();
+          toast('已插队，马上插进当前回合', 2000);
+        } catch (e) {
+          jump.disabled = false;
+          toast('插队失败：' + e.message, 4000);
+        }
+      };
+      row.append(jump);
+    }
     const x = el('button', null, '×');
     x.onclick = async () => {
       if (item.itemId) {
@@ -716,6 +1185,24 @@ function renderThumbs() {
   });
 }
 
+function resetViewportSoon() {
+  const vv = window.visualViewport;
+  const kb = vv ? (window.innerHeight - vv.height) > 120 : false;
+  if (!kb) {
+    document.documentElement.style.setProperty('--vv-top', '0px');
+    document.documentElement.style.setProperty('--app-h', '100vh');
+  }
+  setTimeout(syncViewport, 200);
+  setTimeout(syncViewport, 700);
+}
+
+async function handlePickedFiles(files) {
+  const imgs = files.filter((f) => (f.type || '').startsWith('image/'));
+  const others = files.filter((f) => !(f.type || '').startsWith('image/'));
+  if (imgs.length) await pickImages(imgs);
+  if (others.length) await pickFiles(others);
+}
+
 async function pickImages(files) {
   for (const f of files) {
     if (!f.type.startsWith('image/')) continue;
@@ -723,6 +1210,7 @@ async function pickImages(files) {
     catch { toast('图片处理失败：' + f.name, 4000); }
   }
   renderThumbs();
+  resetViewportSoon();
 }
 
 /* ---------- 文件上传 ---------- */
@@ -748,6 +1236,7 @@ async function pickFiles(files) {
     } catch (e) { toast('文件上传失败：' + e.message, 5000); }
   }
   renderThumbs();
+  resetViewportSoon();
 }
 
 /* ---------- 发送 ---------- */
@@ -779,7 +1268,7 @@ async function sendPrompt() {
   const envId = rid();
   try {
     await rpc('session/prompt', { request: {
-      requestId, sessionId: state.sessionId, mode: state.mode,
+      requestId, sessionId: state.sessionId, mode: 'steer',
       content, clientTimeZone: nowTZ(),
     }}, { rpcId: envId });
     if (!queued) state.shownRpc.add(requestId);   // 实测 source.rpcId === 我们发的 requestId
@@ -798,6 +1287,11 @@ async function sendPrompt() {
     }
     for (const f of fls) bubble.append(el('div', 'fcard', '📎 ' + f.name));
     $('#messages').append(bubble);
+    // 插话模式下当前回合还在跑：状态行要跟到这条消息下面，别停在上面
+    if (state.thinkRow) {
+      $('#messages').append(state.thinkRow.el);
+      if (state.toolRow) $('#messages').append(state.toolRow.el);
+    }
     scrollBottom(true);
     requestAnimationFrame(() => scrollBottom(true));
   } catch (e) {
@@ -882,9 +1376,17 @@ async function answerRaw(eventId, value) {
 }
 
 /* ---------- 启动 ---------- */
-$('#back').onclick = closeSession;
+$('#back').onclick = () => {
+  if (history.state?.dshView === 'chat') history.back();
+  else closeSession();
+};
+window.addEventListener('popstate', () => {
+  if (state.view === 'chat') closeSession();
+});
 $('#refresh').onclick = () => { if (state.view === 'list') loadSessions().catch((e) => toast(e.message)); else if (state.sessionId) { const it = state.sessions.find((s) => s.sessionId === state.sessionId); if (it) openSession(it); } };
 $('#stop').onclick = (e) => { e.preventDefault(); stopRun(); };
+$('#messages').addEventListener('scroll', updateJumpBtn, { passive: true });
+$('#jumpbtn').onclick = () => { scrollBottom(true); updateJumpBtn(); };
 $('#input').addEventListener('focus', () => { setTimeout(syncViewport, 120); setTimeout(syncViewport, 420); });
 $('#input').addEventListener('blur', () => { setTimeout(syncViewport, 120); setTimeout(syncViewport, 420); });
 // 文件选择器按需创建、用完立即移除：页面上只保留输入框一个表单控件，
@@ -904,8 +1406,27 @@ function pickFileOnce({ accept = '', multiple = false, onPick }) {
   inp.click();
 }
 
-$('#attach').onclick = () => pickFileOnce({ accept: 'image/*', multiple: true, onPick: pickImages });
-$('#attachfile').onclick = () => pickFileOnce({ multiple: true, onPick: pickFiles });
+function closeAttachMenu() { $('#attachmenu').hidden = true; }
+$('#attach').onclick = (e) => { e.stopPropagation(); openGoalSheet(); };
+$('#attachimg').onclick = (e) => {
+  e.stopPropagation();
+  // 不限制 accept：系统面板里照片/拍照/选取文件都能用；
+  // 图片走压缩内联，其它文件走上传
+  pickFileOnce({ multiple: true, onPick: handlePickedFiles });
+};
+const rowClose = $('#row-close'); if (rowClose) rowClose.onclick = () => { $('#rowmenu').hidden = true; };
+const rowMask = $('#rowmenu')?.querySelector('.sheet-mask'); if (rowMask) rowMask.onclick = () => { $('#rowmenu').hidden = true; };
+const plusClose = $('#plus-close'); if (plusClose) plusClose.onclick = () => { $('#plusmenu').hidden = true; };
+const plusMask = $('#plusmenu')?.querySelector('.sheet-mask'); if (plusMask) plusMask.onclick = () => { $('#plusmenu').hidden = true; };
+$('#pick-image').onclick = (e) => {
+  e.stopPropagation(); closeAttachMenu();
+  pickFileOnce({ accept: 'image/*', multiple: true, onPick: pickImages });
+};
+$('#pick-file').onclick = (e) => {
+  e.stopPropagation(); closeAttachMenu();
+  pickFileOnce({ multiple: true, onPick: pickFiles });
+};
+document.addEventListener('click', closeAttachMenu);
 let verTaps = 0, verTapTimer = null;
 $('#ver').addEventListener('click', () => {
   verTaps += 1;
@@ -918,7 +1439,6 @@ $('#ver').addEventListener('click', () => {
     setTimeout(() => location.reload(), 600);
   }
 });
-bindMode();
 $('#composer').addEventListener('submit', (e) => { e.preventDefault(); sendPrompt(); });   // 回车走 keydown，这里只兜底
 $('#input').addEventListener('focus', scheduleClamp);
 $('#input').addEventListener('blur', scheduleClamp);
@@ -985,6 +1505,9 @@ window.addEventListener('online', () => {
   }
 });
 window.addEventListener('offline', () => { state.connState = 'offline'; renderStats(); });
+$('#goalbar').onclick = () => openGoalSheet();
+$('#goal-close').onclick = () => { $('#goalsheet').hidden = true; };
+$('#goalsheet').querySelector('.sheet-mask').onclick = () => { $('#goalsheet').hidden = true; };
 $('#modelbar').onclick = () => openModelSheet().catch(() => {});
 $('#sheet-close').onclick = closeModelSheet;
 $('#modelsheet').querySelector('.sheet-mask').onclick = closeModelSheet;

@@ -29,18 +29,46 @@
     <button id="modelbar" type="button"><span id="modelname">模型</span> <span class="caret">▾</span></button>
     <div id="stats"></div>
     <div id="messages"></div>
+    <button id="jumpbtn" type="button" hidden>↓</button>
     <div id="pending"></div>
+    <div id="goalbar" hidden></div>
+    <div id="tasks" hidden></div>
+    <div id="thinkline" hidden></div>
     <div id="queue" hidden></div>
     <div id="thumbs" hidden></div>
     <form id="composer" autocomplete="off">
-      <button id="attach" type="button" aria-label="发送图片">＋</button>
-      <button id="attachfile" type="button" aria-label="发送文件">📎</button>
+      <button id="attach" type="button" aria-label="目标任务" title="目标任务">＋</button>
+      <button id="attachimg" type="button" aria-label="附件" title="图片或文件">📎</button>
+      <div id="attachmenu" hidden>
+        <button id="pick-image" type="button">🖼 图片</button>
+        <button id="pick-file" type="button">📄 文件</button>
+      </div>
       <textarea id="input" rows="1" placeholder="发消息…" enterkeyhint="send"></textarea>
-      <button id="mode" type="button" title="发送方式">排队</button>
       <button id="stop" type="button" hidden>停止</button>
     </form>
   </section>
 
+  <div id="rowmenu" hidden>
+    <div class="sheet-mask"></div>
+    <div class="sheet">
+      <div class="sheet-head"><span id="rowmenu-title">会话操作</span><button id="row-close">关闭</button></div>
+      <div id="row-list"></div>
+    </div>
+  </div>
+  <div id="plusmenu" hidden>
+    <div class="sheet-mask"></div>
+    <div class="sheet">
+      <div class="sheet-head"><span>添加</span><button id="plus-close">关闭</button></div>
+      <div id="plus-list"></div>
+    </div>
+  </div>
+  <div id="goalsheet" hidden>
+    <div class="sheet-mask"></div>
+    <div class="sheet">
+      <div class="sheet-head"><span>目标任务</span><button id="goal-close">关闭</button></div>
+      <div id="goal-body"></div>
+    </div>
+  </div>
   <div id="modelsheet" hidden>
     <div class="sheet-mask"></div>
     <div class="sheet">
