@@ -26,7 +26,20 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.3.2';
+const VERSION = '1.3.3';
+
+// 客户端机器标识：远端据此区分不同电脑（同名可改 config.json 的 "clientName"）
+function clientName() {
+  try {
+    const cfgPath = path.join(process.env.APPDATA || '', 'DSH Desktop', 'config.json');
+    if (fs.existsSync(cfgPath)) {
+      const c = JSON.parse(fs.readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, ''));
+      if (c && typeof c.clientName === 'string' && c.clientName.trim()) return c.clientName.trim();
+    }
+  } catch {}
+  try { return os.hostname() || 'unknown'; } catch { return 'unknown'; }
+}
+const CLIENT_ID = clientName();
 
 // ---------------------------------------------------------------- 配置
 
@@ -236,6 +249,7 @@ function upstreamHeaders(extra = {}) {
     host: UP_HOST,
     origin: UP_ORIGIN,
     authorization: AUTH,
+    'x-dsh-client': CLIENT_ID,
     ...extra,
   };
   if (sessionCookie) headers.cookie = sessionCookie;
@@ -967,7 +981,7 @@ async function fetchAsOfSeq(sessionId) {
 }
 
 function muxHeaders() {
-  const h = { origin: UP_ORIGIN, authorization: AUTH };
+  const h = { origin: UP_ORIGIN, authorization: AUTH, 'x-dsh-client': CLIENT_ID };
   if (sessionCookie) h.cookie = sessionCookie;
   return h;
 }
