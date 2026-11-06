@@ -1,8 +1,6 @@
 {
-  "upstream": "https://dsh.example.com:19306",
+  "upstream": "https://tnty.9017i.cc:19306",
   "basicUser": "dsh",
-  "basicPass": "__BASIC_PASS__",
-  "token": "__DSH_TOKEN__",
   "port": 19390,
   "openBrowser": false,
   "prefetch": false,
@@ -12,7 +10,7 @@
   "update": {
     "enabled": true,
     "manifests": [
-      "https://dsh.example.com:19306/downloads/version.json"
+      "https://tnty.9017i.cc:19306/downloads/version.json"
     ],
     "extraManifests": [],
     "checkIntervalHours": 6,
