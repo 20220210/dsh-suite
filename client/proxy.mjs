@@ -2,7 +2,7 @@
 /**
  * DSH 本地缓存客户端（阶段1+2 的代理核心）
  *
- * 浏览器/窗口 -> 127.0.0.1:19390 (本进程) -> https://dsh.example.com:19306 -> DSH
+ * 浏览器/窗口 -> 127.0.0.1:19390 (本进程) -> https://tnty.9017i.cc:19306 -> DSH
  *
  * 做的三件事：
  *  1) 认证代劳：Basic Auth + DSH 登录 token/cookie，浏览器无需输入
@@ -26,7 +26,20 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.3.2';
+const VERSION = '1.3.3';
+
+// 客户端机器标识：远端据此区分不同电脑（同名可改 config.json 的 "clientName"）
+function clientName() {
+  try {
+    const cfgPath = path.join(process.env.APPDATA || '', 'DSH Desktop', 'config.json');
+    if (fs.existsSync(cfgPath)) {
+      const c = JSON.parse(fs.readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, ''));
+      if (c && typeof c.clientName === 'string' && c.clientName.trim()) return c.clientName.trim();
+    }
+  } catch {}
+  try { return os.hostname() || 'unknown'; } catch { return 'unknown'; }
+}
+const CLIENT_ID = clientName();
 
 // ---------------------------------------------------------------- 配置
 
@@ -54,7 +67,7 @@ function loadConfig() {
     process.exit(1);
   }
   const out = {
-    upstream: cfg.upstream ?? 'https://dsh.example.com:19306',
+    upstream: cfg.upstream ?? 'https://tnty.9017i.cc:19306',
     basicUser: cfg.basicUser ?? '',
     basicPass: cfg.basicPass ?? '',
     token: cfg.token ?? '',
@@ -74,8 +87,8 @@ function loadConfig() {
 
 const cfg = loadConfig();
 const UP = new URL(cfg.upstream);
-const UP_HOST = UP.host; // 含端口，如 dsh.example.com:19306
-const UP_ORIGIN = UP.origin; // https://dsh.example.com:19306
+const UP_HOST = UP.host; // 含端口，如 tnty.9017i.cc:19306
+const UP_ORIGIN = UP.origin; // https://tnty.9017i.cc:19306
 const UP_HOSTNAME = UP.hostname;
 const UP_PORT = UP.port ? Number(UP.port) : 443;
 // 桌面壳用 Windows DPAPI 加密保存凭据，启动时解密后通过环境变量注入；直接运行代理时退回 config 明文
@@ -236,6 +249,7 @@ function upstreamHeaders(extra = {}) {
     host: UP_HOST,
     origin: UP_ORIGIN,
     authorization: AUTH,
+    'x-dsh-client': CLIENT_ID,
     ...extra,
   };
   if (sessionCookie) headers.cookie = sessionCookie;
@@ -967,7 +981,7 @@ async function fetchAsOfSeq(sessionId) {
 }
 
 function muxHeaders() {
-  const h = { origin: UP_ORIGIN, authorization: AUTH };
+  const h = { origin: UP_ORIGIN, authorization: AUTH, 'x-dsh-client': CLIENT_ID };
   if (sessionCookie) h.cookie = sessionCookie;
   return h;
 }
