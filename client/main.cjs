@@ -1,7 +1,7 @@
 // DSH 桌面版 v1.2.0 —— Electron 主进程（绿色版）
 // 职责：单实例 → 准备配置 → 拉起本地缓存代理 → 等代理就绪 → 打开窗口
 //       → 首次运行创建桌面快捷方式 → 定期检查更新（一键升级）
-const { app, BrowserWindow, Menu, dialog, shell, Tray, nativeImage, Notification, safeStorage, nativeTheme } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, Tray, nativeImage, Notification, safeStorage, nativeTheme, ipcMain } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -20,6 +20,7 @@ if (process.env.DSH_DEBUG_CDP === '1') {
 
 let mainWindow = null;
 let proxyChild = null;
+let CONFIG_PATH = null;
 let updater = null;
 let checkTimer = null;
 let tray = null;
@@ -318,6 +319,51 @@ function ensureStartMenuShortcut() {
 
 // ------------------------------------------------ 代理子进程
 
+/** 首次运行 / 密码失效时，用一个小窗口让用户输入访问密码（不落明文，保存后 DPAPI 加密）。 */
+function promptPassword(reason) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(typeof value === 'string' && value.trim() ? value.trim() : null);
+    };
+    const win = new BrowserWindow({
+      width: 430, height: 230, resizable: false, minimizable: false, maximizable: false,
+      title: 'DSH Desktop 登录',
+      parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+      modal: true, show: false, alwaysOnTop: true,
+      webPreferences: { nodeIntegration: true, contextIsolation: false },
+    });
+    try { win.setMenuBarVisibility(false); } catch {}
+    const html = `<!doctype html><meta charset="utf-8"><style>
+      body{font-family:"Microsoft YaHei",system-ui,sans-serif;background:#fff;margin:0;padding:18px;color:#111}
+      h3{margin:0 0 6px;font-size:15px}p{color:#666;font-size:12px;margin:0 0 12px;line-height:1.5}
+      input{width:100%;box-sizing:border-box;padding:9px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+      .row{margin-top:14px;text-align:right}
+      button{padding:7px 16px;border-radius:6px;border:1px solid #ccc;background:#f5f5f5;cursor:pointer;font-size:13px}
+      button.primary{background:#2d6cdf;border-color:#2d6cdf;color:#fff;margin-left:8px}
+    </style>
+    <h3>${reason || '请输入访问密码'}</h3>
+    <p>用户名 <b>dsh</b>。密码只会加密保存在本机，不会以明文落盘。</p>
+    <input id="pw" type="password" placeholder="访问密码">
+    <div class="row"><button id="cancel">取消</button><button id="ok" class="primary">确定</button></div>
+    <script>
+      const { ipcRenderer } = require('electron');
+      const pw = document.getElementById('pw');
+      const send = (v) => ipcRenderer.send('dsh-pw-result', v);
+      document.getElementById('ok').onclick = () => send(pw.value);
+      document.getElementById('cancel').onclick = () => send(null);
+      pw.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(pw.value); });
+      setTimeout(() => pw.focus(), 60);
+    </script>`;
+    win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+    ipcMain.once('dsh-pw-result', (ev, value) => { try { win.close(); } catch {} done(value); });
+    win.on('closed', () => done(null));
+    win.once('ready-to-show', () => { win.show(); win.focus(); });
+  });
+}
+
 function startProxy(cfgPath) {
   const proxyScript = path.join(__dirname, 'proxy.mjs');
   const out = fs.createWriteStream(logFile(), { flags: 'a' });
@@ -600,14 +646,29 @@ function checkAuthState(stats) {
     const opts = {
       type: 'warning',
       title: '登录凭据失效',
-      message: '访问令牌可能已过期或被更换',
-      detail: '客户端会自动尝试重新登录；如果一直失败，请在「帮助 → 更新访问令牌」里更新 token。',
-      buttons: ['更新令牌', '稍后'],
+      message: '服务器拒绝了当前凭据',
+      detail: '可能是服务器更换了访问密码。点「重新输入密码」后输入新密码即可（会自动加密保存并重连）。',
+      buttons: ['重新输入密码', '稍后'],
       noLink: true,
     };
     const show = mainWindow && !mainWindow.isDestroyed() ? dialog.showMessageBox(mainWindow, opts) : dialog.showMessageBox(opts);
-    show.then((r) => {
-      if (r.response === 0) showTokenUpdateHelp();
+    show.then(async (r) => {
+      if (r.response !== 0) return;
+      const pw = await promptPassword('请输入新的访问密码');
+      if (!pw) return;
+      const cfg = readConfig();
+      saveConfig({ ...cfg, basicUser: cfg.basicUser || 'dsh', basicPass: pw });
+      try {
+        stopProxy();
+        await new Promise((res) => setTimeout(res, 700));
+        startProxy(CONFIG_PATH || ensureConfig());
+        const ok = await waitProxy(30000);
+        authWarned = false;
+        if (ok && mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(PROXY_URL);
+        mainLog('已用新密码重启本地代理');
+      } catch (error) {
+        mainLog('用新密码重启代理失败: ' + String(error && error.message ? error.message : error));
+      }
     });
   }
 }
@@ -900,6 +961,18 @@ if (!gotLock) {
       console.error('凭据加密/权限收紧失败', error);
     }
     const cfgPath = ensureConfig();
+    CONFIG_PATH = cfgPath;
+    // 1.3.4 起安装包不再内置密码：首次运行或密码缺失时弹窗输入
+    {
+      const rc = runtimeConfig();
+      if (!rc.basicPass) {
+        const pw = await promptPassword('首次运行，请输入服务器访问密码');
+        if (!pw) { app.quit(); return; }
+        const cfg = readConfig();
+        saveConfig({ ...cfg, basicUser: cfg.basicUser || 'dsh', basicPass: pw });
+        mainLog('已保存访问密码（DPAPI 加密）');
+      }
+    }
     setupTray();
     // 开机自启：默认开启（用户可在托盘菜单关掉；关掉后下次不会自动恢复）
     const bootCfg = readConfig();
