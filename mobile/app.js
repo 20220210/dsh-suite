@@ -1,9 +1,31 @@
 'use strict';
 const CE_MODE = localStorage.getItem('dshm.ce') === '1';   // 富文本输入模式（实验）
-// 实例：/m2/ = rc.2 实例（服务器 3081），其它路径 = 主实例。所有 API 自动加前缀。
-const IS_RC2 = location.pathname.startsWith('/m2');
+// 实例：可在顶部按钮切换（localStorage 记住）；/m2/ 路径强制 rc.2。所有 API 自动加前缀。
+const PATH_RC2 = location.pathname.startsWith('/m2');
+let INSTANCE = PATH_RC2 ? 'rc2' : (localStorage.getItem('dshm.inst') === 'rc2' ? 'rc2' : 'main');
+const IS_RC2 = INSTANCE === 'rc2';
 const API_BASE = IS_RC2 ? '/m2' : '';
 const HOME_PATH = IS_RC2 ? '/m2/' : '/m/';
+
+/** 顶部按钮：主实例 ↔ rc.2 实例。切到 rc.2 时先去 /m2/login 种 cookie 再回来。 */
+function wireInstanceSwitch() {
+  const btn = document.getElementById('inst');
+  if (btn) {
+    btn.textContent = IS_RC2 ? 'rc2' : '主';
+    btn.title = IS_RC2 ? '当前 rc.2 实例，点击切回主实例' : '当前主实例，点击切到 rc.2 实例';
+    btn.onclick = () => {
+      if (IS_RC2) {
+        localStorage.setItem('dshm.inst', 'main');
+        location.href = '/m/';
+        return;
+      }
+      localStorage.setItem('dshm.inst', 'rc2');
+      // 先让 nginx 用 dshm 换一个 rc.2 的 cookie，成功后回 /m/
+      location.href = '/m2/login?back=' + encodeURIComponent('/m/');
+    };
+  }
+}
+wireInstanceSwitch();
 
 function showFatal(msg) {
   try {
@@ -21,7 +43,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '139';   // 部署时由脚本替换成时间戳
+const BUILD = '140';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -97,8 +119,8 @@ async function passwordLogin(pw) {
 
 async function login() {
   if (IS_RC2) {
-    // rc.2 实例：让 nginx 用 dshm 换一个 rc.2 的 cookie，再回到 /m2/
-    location.replace('/m2/login');
+    // rc.2 实例：让 nginx 用 dshm 换一个 rc.2 的 cookie，再回到当前页
+    location.replace('/m2/login?back=' + encodeURIComponent(location.pathname));
     await new Promise(() => {});
   }
   if (loginAttempted) { showGate('登录失败，请关掉页面重新打开'); throw new Error('未登录'); }
