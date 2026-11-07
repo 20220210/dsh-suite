@@ -1,5 +1,5 @@
 // 网络优先 + 离线兜底：普通刷新就能拿到最新文件，不用重装
-const CACHE = 'dsh-m-139';
+const CACHE = 'dsh-m-140';
 const SHELL = ['/m/', '/m/app.js', '/m/style.css', '/m/manifest.webmanifest', '/m/icon-192.png'];
 
 self.addEventListener('install', (e) => {

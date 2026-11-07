@@ -91,7 +91,11 @@ class H(BaseHTTPRequestHandler):
             for pair in jar.split("; "):
                 if "=" in pair:
                     self.send_header("Set-Cookie", pair + "; Path=/; Max-Age=2592000; SameSite=Lax")
-            self.send_header("Location", "/m2/")
+            from urllib.parse import urlparse, parse_qs
+            back = (parse_qs(urlparse(self.path).query).get("back") or ["/m2/"])[0]
+            if not back.startswith("/") or back.startswith("//"):
+                back = "/m2/"
+            self.send_header("Location", back)
             self.send_header("content-length", "0")
             self.end_headers()
             return
