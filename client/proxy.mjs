@@ -23,10 +23,13 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, exec } from 'node:child_process';
+import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.3.4';
+const VERSION = '1.4.9';
+// 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
+const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
 // 客户端机器标识：远端据此区分不同电脑（同名可改 config.json 的 "clientName"）
 function clientName() {
@@ -118,8 +121,8 @@ const COOKIE_FILE = path.join(CACHE_DIR, 'cookie.txt');
 const LOG_FILE = path.join(CACHE_DIR, 'proxy.log');
 const LIST_DISK_FILE = path.join(CACHE_DIR, 'session-list.json');
 const LIST_DISK_META = path.join(CACHE_DIR, 'session-list.meta');
-/** 磁盘上的 session/list 缓存：多久内可以直接当首屏数据用（之后仍回网络） */
-const LIST_DISK_TTL = 10 * 60 * 1000;
+/** 本地快照超过这个时间就顺手触发一次后台增量刷新（不影响本次响应速度） */
+const LIST_REFRESH_MS = 60 * 1000;
 for (const d of [CACHE_DIR, API_DIR, STATIC_DIR]) fs.mkdirSync(d, { recursive: true });
 
 // ---------------------------------------------------------------- 日志 / 统计
@@ -151,6 +154,17 @@ const stats = {
   wsTunnels: 0,
   bytesSaved: 0,
   listDiskHit: 0,
+  listHitMem: 0,
+  listNet: 0,
+  listBlockMs: 0,
+  listBlockCount: 0,
+  listDirty: false,
+  listIndexSize: 0,
+  listIndexAt: 0,
+  listNetAt: 0,
+  listNetMs: 0,
+  listBackoffMs: 0,
+  listMerge: null,
   authError: false,
   relogin: 0,
   tokenRefreshed: 0,
@@ -159,7 +173,9 @@ const stats = {
 
 // ---------------------------------------------------------------- 上游请求
 
-const agent = new https.Agent({ keepAlive: true, maxSockets: 8 });
+// 连接池要够宽：官方界面有 1Hz 的 /dsh-purge/rewind 轮询 + 若干长连接，
+// 原来 8 个 socket 一占满，GET / 会一直排队 → 桌面版窗口一片黑。
+const agent = new https.Agent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 8, keepAliveMsecs: 15000 });
 let sessionCookie = '';
 function readCookieFile() {
   try {
@@ -455,31 +471,134 @@ let listSlot = { at: 0, meta: null, body: null };
 
 const LIST_SHAPE_RE = /^(session\/(archive|unarchive|delete|rename|fork|resume|create)|workspace\/write)/;
 
+/* ───────────── 会话列表「增量」层 ─────────────
+ * DSH 的 session/list 是每次全量重算、单线程 100~140 秒的重接口。客户端省不了它的算力，
+ * 能做的是「不让界面等它，也不重复算同一份结果」：
+ *   1. 内存/磁盘快照永远可直接响应（不再因为过期就掉回网络）；
+ *   2. 网络结果回来后按 sessionId 增量合并，统计 新增/变化/消失/未变；
+ *   3. 合并后没有变化就不写盘、不换 slot，界面不抖动；
+ *   4. 后台刷新单飞 + 失败退避（30s→300s），避免反复压垮 DSH；
+ *   5. 只有「本地一条快照都没有」的冷启动才同步等网络。
+ */
+let listIndex = new Map();   // sessionId -> 行（最近一次合并后的权威副本）
+let listIndexAt = 0;
+let listNetAt = 0;           // 最近一次成功拉网络的时间
+let listNetMs = 0;           // 最近一次网络耗时
+let listBackoffMs = 0;       // 失败退避窗口
+let listBackoffUntil = 0;
+let listBlockMs = 0;         // 同步等网络累计耗时（应趋于 0）
+let listBlockCount = 0;
+let listDirty = false;       // 有写操作动过列表，等后台对齐
+let listRefreshInflight = null;
+let listMerge = { at: 0, added: 0, updated: 0, removed: 0, unchanged: 0, total: 0 };
+
+/** 从任意形状的 session/list 响应体取 items（自动解压；失败返回 null）。 */
+function listItemsOf(body, headers) {
+  if (!body?.length) return null;
+  try {
+    const plain = decodeCachedBody(body, headers ?? {});
+    const obj = JSON.parse(plain.toString('utf8'));
+    const items = obj?.result?.value?.items;
+    return Array.isArray(items) ? { obj, items } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 用上一次响应的信封重建 body，只替换 items（rpcId 由回放时重写）。 */
+function buildListBody(items, template) {
+  let out;
+  try {
+    out = JSON.parse(JSON.stringify(template ?? {}));
+  } catch {
+    out = {};
+  }
+  if (!out.result || typeof out.result !== 'object') out.result = {};
+  if (!out.result.value || typeof out.result.value !== 'object') out.result.value = {};
+  out.result.value.items = items;
+  delete out.rpcId;
+  return Buffer.from(JSON.stringify(out), 'utf8');
+}
+
+/** 增量合并：以服务端为准，统计新增/变化/消失；无变化则复用旧 body。 */
+function mergeListItems(items, template) {
+  const next = new Map();
+  let added = 0;
+  let updated = 0;
+  let unchanged = 0;
+  for (const it of items) {
+    const id = it?.sessionId;
+    if (!id) continue;
+    next.set(id, it);
+    const prev = listIndex.get(id);
+    if (prev === undefined) added += 1;
+    else if (JSON.stringify(prev) === JSON.stringify(it)) unchanged += 1;
+    else updated += 1;
+  }
+  let removed = 0;
+  for (const id of listIndex.keys()) if (!next.has(id)) removed += 1;
+  const changed = added > 0 || updated > 0 || removed > 0;
+  listIndex = next;
+  listIndexAt = Date.now();
+  listMerge = { at: listIndexAt, added, updated, removed, unchanged, total: next.size };
+  return {
+    changed,
+    merged: listMerge,
+    body: changed || !listSlot.body ? buildListBody(items, template) : listSlot.body,
+  };
+}
+
+/** 会话列表 items：快照够新就直接用，否则等一次网络（预取/探测复用，避免各拉一遍全量）。 */
+async function ensureListItems(maxAgeMs = 30000) {
+  if (listSlot.meta && Date.now() - listSlot.at < maxAgeMs) {
+    const parsed = listItemsOf(listSlot.body, listSlot.meta);
+    if (parsed) return parsed.items;
+  }
+  const body = await refreshListInBackground({ force: true });
+  const parsed = listItemsOf(body ?? listSlot.body, { 'content-type': 'application/json' });
+  return parsed?.items ?? [];
+}
+
 function clearApiCache(method) {
   try {
     for (const f of fs.readdirSync(API_DIR)) fs.unlinkSync(path.join(API_DIR, f));
   } catch {}
-  listSlot = { at: 0, meta: null, body: null };
   const m = String(method ?? '');
-  // 只有“会话列表本身会变”的操作才清磁盘首屏缓存；普通对话/取消不影响首屏加速
+  // 列表形状变了：不再删掉本地快照（删了下次就得同步等 100 秒），
+  // 改成「保留快照 + 立即后台增量对齐」，界面任何时刻都有东西可渲染。
   if (LIST_SHAPE_RE.test(m)) {
-    try {
-      fs.unlinkSync(LIST_DISK_FILE);
-      fs.unlinkSync(LIST_DISK_META);
-    } catch {}
-    log(`会话列表变化（${m}），已清空磁盘列表缓存`);
+    listDirty = true;
+    log(`会话列表变化（${m}），保留本地快照，后台增量对齐`);
+    const t = setTimeout(() => refreshListInBackground({ force: true }), 300);
+    try { t.unref?.(); } catch {}
   } else if (m) {
     log(`接口缓存已清（${m}），保留磁盘首屏缓存`);
   }
 }
 
-/** 读磁盘上的 session/list 缓存（用于重启后首屏直接用本地数据）。 */
+/** 读磁盘上的 session/list 快照（重启后首屏直接用本地数据），并顺手恢复增量索引。 */
 function readListDisk() {
   try {
     const meta = JSON.parse(fs.readFileSync(LIST_DISK_META, 'utf8'));
     const body = fs.readFileSync(LIST_DISK_FILE);
     if (!body?.length) return null;
-    return { at: Number(meta.at) || 0, headers: meta.headers ?? { 'content-type': 'application/json' }, body };
+    const headers = meta.headers ?? { 'content-type': 'application/json' };
+    if (listIndex.size === 0) {
+      const parsed = listItemsOf(body, headers);
+      if (parsed) {
+        listIndex = new Map(parsed.items.filter((it) => it?.sessionId).map((it) => [it.sessionId, it]));
+        listIndexAt = Number(meta.at) || 0;
+        listMerge = {
+          at: listIndexAt,
+          added: listIndex.size,
+          updated: 0,
+          removed: 0,
+          unchanged: 0,
+          total: listIndex.size,
+        };
+      }
+    }
+    return { at: Number(meta.at) || 0, headers, body };
   } catch {
     return null;
   }
@@ -498,6 +617,10 @@ function writeListDisk(body, headers) {
 /** 供桌面壳轮询：返回会话运行状态（任务完成通知用）。 */
 function handleWatch(res) {
   try {
+    if (!listSlot.meta) {
+      const d = readListDisk();
+      if (d) listSlot = { at: d.at, meta: d.headers, body: d.body };
+    }
     if (!listSlot.meta || Date.now() - listSlot.at > 20000) refreshListInBackground();
     let items = [];
     try {
@@ -518,23 +641,42 @@ function handleWatch(res) {
   }
 }
 
-let listRefreshing = false;
-/** 命中磁盘缓存后，后台再拉一次最新列表，供下次启动使用（stale-while-revalidate）。 */
-async function refreshListInBackground() {
-  if (listRefreshing) return;
-  listRefreshing = true;
-  try {
-    const r = await rawApiCall('session/list', { _request: {} }, { gzip: false });
-    if (r.status === 200 && r.body?.length) {
-      listSlot = { at: Date.now(), meta: { 'content-type': 'application/json' }, body: r.body };
-      writeListDisk(r.body, { 'content-type': 'application/json' });
+/** 后台拉一次 session/list 并与本地索引增量合并（单飞 + 退避，失败不影响界面）。 */
+function refreshListInBackground({ force = false } = {}) {
+  if (listRefreshInflight) return listRefreshInflight;
+  if (!force && Date.now() < listBackoffUntil) return Promise.resolve(null);
+  const started = Date.now();
+  listRefreshInflight = (async () => {
+    try {
+      const r = await rawApiCall('session/list', { _request: {} }, { gzip: false });
+      if (r.status !== 200 || !r.body?.length) throw new Error('status=' + r.status);
+      const parsed = listItemsOf(r.body, { 'content-type': 'application/json' });
+      if (!parsed) throw new Error('响应解析失败');
+      listNetMs = Date.now() - started;
+      const out = mergeListItems(parsed.items, parsed.obj);
+      const headers = { 'content-type': 'application/json; charset=utf-8' };
+      if (out.changed || !fs.existsSync(LIST_DISK_FILE)) writeListDisk(out.body, headers);
+      listSlot = { at: listIndexAt, meta: headers, body: out.body };
+      listNetAt = Date.now();
+      listBackoffMs = 0;
+      listBackoffUntil = 0;
+      listDirty = false;
       stats.apiStored += 1;
+      stats.listNet += 1;
+      log(
+        `session/list 增量合并 ${out.merged.total} 条（新增${out.merged.added} 变化${out.merged.updated} 消失${out.merged.removed} 未变${out.merged.unchanged}）耗时 ${(listNetMs / 1000).toFixed(1)}s${out.changed ? '' : '；无变化，不写盘'}`,
+      );
+      return out.body;
+    } catch (error) {
+      listBackoffMs = listBackoffMs ? Math.min(listBackoffMs * 2, 300000) : 30000;
+      listBackoffUntil = Date.now() + listBackoffMs;
+      log(`后台刷新 session/list 失败: ${String(error?.message ?? error)}；退避 ${Math.round(listBackoffMs / 1000)}s`);
+      return null;
+    } finally {
+      listRefreshInflight = null;
     }
-  } catch (error) {
-    log('后台刷新 session/list 失败:', String(error?.message ?? error));
-  } finally {
-    listRefreshing = false;
-  }
+  })();
+  return listRefreshInflight;
 }
 
 function staticCachePath(key) {
@@ -641,17 +783,21 @@ async function prefetchAll() {
   prefetchRunning = true;
   const t0 = Date.now();
   try {
-    const listRes = await rawApiCall('session/list', { _request: {} }, { gzip: false });
+    // 复用同一份列表（增量层已保证不重复拉全量），不再单独打一次 session/list
     let items = [];
     try {
-      const parsed = JSON.parse(listRes.body.toString('utf8'));
-      items = parsed?.result?.value?.items ?? [];
+      items = await ensureListItems(60000);
     } catch (error) {
-      log('预取：session/list 解析失败', String(error?.message ?? error));
+      log('预取：取会话列表失败', String(error?.message ?? error));
     }
-    if (listRes.status === 200 && listRes.body?.length) {
-      listSlot = { at: Date.now(), meta: { 'content-type': 'application/json' }, body: listRes.body };
-      writeListDisk(listRes.body, { 'content-type': 'application/json' });
+    if (items.length === 0) {
+      const listRes = await rawApiCall('session/list', { _request: {} }, { gzip: false });
+      try {
+        const parsed = listItemsOf(listRes.body, { 'content-type': 'application/json' });
+        items = parsed?.items ?? [];
+      } catch (error) {
+        log('预取：session/list 解析失败', String(error?.message ?? error));
+      }
     }
     log(`预取：发现 ${items.length} 个会话`);
     const queue = items
@@ -703,11 +849,7 @@ async function prefetchRecentSnapshots() {
   if (count === 0 || snapPrefetchRunning) return;
   snapPrefetchRunning = true;
   try {
-    const listRes = await rawApiCall('session/list', { _request: {} }, { gzip: false });
-    let items = [];
-    try {
-      items = JSON.parse(listRes.body.toString('utf8'))?.result?.value?.items ?? [];
-    } catch {}
+    const items = await ensureListItems(60000);
     const targets = items.filter((it) => it && it.sessionId).slice(0, count).map((it) => it.sessionId);
     if (targets.length === 0) return;
     const t0 = Date.now();
@@ -777,13 +919,18 @@ function proxyStatic(req, res, reqPath) {
     });
 }
 
+/** 这些路径是长连接（SSE/事件流），不能设超时；其余普通 GET 统一超时，防止 socket 被永久占用。 */
+const LONG_LIVED_PATH = /^\/(plugins\/events|agent|push\/|mobile-link\/events|api\/remote\.mux)/;
+
 function streamThrough(req, res, reqPath) {
   const headers = upstreamHeaders({
     accept: req.headers.accept ?? '*/*',
     'accept-encoding': req.headers['accept-encoding'] ?? 'gzip',
     'user-agent': req.headers['user-agent'] ?? 'dsh-client',
   });
-  requestUpstream({ method: req.method, path: reqPath, headers, timeoutMs: 0 })
+  const pathname = String(reqPath).split('?')[0];
+  const timeoutMs = LONG_LIVED_PATH.test(pathname) ? 0 : 30000;
+  requestUpstream({ method: req.method, path: reqPath, headers, timeoutMs })
     .then(({ res: upRes }) => {
       res.writeHead(upRes.statusCode ?? 502, upRes.headers);
       upRes.pipe(res);
@@ -806,6 +953,23 @@ async function handleApiPost(req, res, reqPath, body) {
   const method = parsed?.method ?? reqPath.replace(/^\/api\//, '');
   const args = parsed?.payload?.args ?? null;
 
+  // 历史分页/跟随：DSH 要求 turnWindow.minMessages ≤ maxMessages，否则直接 400。
+  // 官方界面有时只传 turnWindow 不传 maxMessages，这里补齐。
+  try {
+    const r = args && args.request;
+    if (r && r.turnWindow && typeof r.turnWindow.minMessages === 'number') {
+      let minMsgs = Math.floor(r.turnWindow.minMessages);
+      if (!Number.isFinite(minMsgs) || minMsgs < 1) minMsgs = 1;
+      if (minMsgs > 80) minMsgs = 80;              // 最多一次取 80 条，避免拉太多导致卡顿
+      r.turnWindow.minMessages = minMsgs;
+      if (!Number.isSafeInteger(r.maxMessages) || r.maxMessages < minMsgs) {
+        r.maxMessages = minMsgs;
+        parsed.payload.args = args;
+        body = Buffer.from(JSON.stringify(parsed), 'utf8');
+      }
+    }
+  } catch {}
+
   // 写操作：透传并清缓存
   const mutating = MUTATING_RE.test(String(method));
   if (!parsed || !CACHE_RULES[method] || mutating) {
@@ -813,29 +977,31 @@ async function handleApiPost(req, res, reqPath, body) {
     return streamBufferUpstream(req, res, reqPath, body);
   }
 
-  // session/list 单槽缓存（内存 15 秒 → 磁盘 10 分钟 → 网络）
+  // session/list：内存 15 秒 → 本地快照（任意年龄，直接回）→ 网络（仅冷启动）
   if (method === 'session/list') {
     const ttl = CACHE_RULES['session/list'];
     if (listSlot.meta && Date.now() - listSlot.at < ttl) {
       stats.apiHit += 1;
+      stats.listHitMem += 1;
       const replay = applyRpcId(listSlot.body, listSlot.meta, parsed?.rpcId);
       stats.bytesSaved += replay.body.length;
       return sendBuffer(res, 200, replay.headers, replay.body);
     }
-    const disk = readListDisk();
-    if (disk && Date.now() - disk.at < LIST_DISK_TTL) {
-      listSlot = { at: disk.at, meta: disk.headers, body: disk.body };
+    const snap = listSlot.meta ? listSlot : readListDisk();
+    if (snap) {
+      listSlot = { at: snap.at, meta: snap.headers, body: snap.body };
       stats.listDiskHit += 1;
       stats.apiHit += 1;
-      stats.bytesSaved += disk.body.length;
+      stats.bytesSaved += snap.body.length;
       log(
-        `首屏：session/list 命中磁盘缓存（${Math.round((Date.now() - disk.at) / 1000)} 秒前，${Math.round(disk.body.length / 1024)}KB）`,
+        `首屏：session/list 用本地快照直出（${Math.round((Date.now() - snap.at) / 1000)} 秒前，${Math.round(snap.body.length / 1024)}KB，不等网络）`,
       );
-      refreshListInBackground();
-      const replay = applyRpcId(disk.body, disk.headers, parsed?.rpcId);
+      if (listDirty || Date.now() - snap.at > LIST_REFRESH_MS) refreshListInBackground();
+      const replay = applyRpcId(snap.body, snap.headers, parsed?.rpcId);
       return sendBuffer(res, 200, replay.headers, replay.body);
     }
-    // 用客户端原始请求体转发（保留客户端的 rpcId），再缓存结果
+    // 冷启动：本地一条快照都没有，只能同步等一次（计入 listBlockMs，越小越好）
+    const waitFrom = Date.now();
     const headers = upstreamHeaders({
       'content-type': req.headers['content-type'] ?? 'application/json',
       accept: req.headers.accept ?? 'application/json',
@@ -848,9 +1014,29 @@ async function handleApiPost(req, res, reqPath, body) {
     for await (const c of upRes) chunks.push(c);
     const upBody = Buffer.concat(chunks);
     if (upRes.statusCode === 200) {
-      listSlot = { at: Date.now(), meta: pickHeaders(upRes.headers), body: upBody };
+      const parsedUp = listItemsOf(upBody, upRes.headers ?? {});
+      let outBody = upBody;
+      let outHeaders = upRes.headers ?? {};
+      if (parsedUp) {
+        const out = mergeListItems(parsedUp.items, parsedUp.obj);
+        outHeaders = { 'content-type': 'application/json; charset=utf-8' };
+        outBody = out.body;
+        listSlot = { at: listIndexAt, meta: outHeaders, body: outBody };
+        writeListDisk(outBody, outHeaders);
+        listNetAt = Date.now();
+        listBlockMs += Date.now() - waitFrom;
+        listBlockCount += 1;
+        log(
+          `冷启动：session/list 首次全量 ${out.merged.total} 条，已建索引（阻塞 ${((Date.now() - waitFrom) / 1000).toFixed(1)}s）`,
+        );
+      } else {
+        listSlot = { at: Date.now(), meta: pickHeaders(upRes.headers), body: upBody };
+        writeListDisk(upBody, upRes.headers ?? {});
+      }
       stats.apiStored += 1;
-      writeListDisk(upBody, upRes.headers ?? {});
+      stats.listNet += 1;
+      const replay = applyRpcId(outBody, outHeaders, parsed?.rpcId);
+      return sendBuffer(res, 200, replay.headers, replay.body);
     }
     return sendBuffer(res, upRes.statusCode ?? 502, upRes.headers ?? {}, upBody);
   }
@@ -919,6 +1105,104 @@ function handleApiGet(req, res, reqPath) {
   streamThrough(req, res, reqPath);
 }
 
+// ---------------------------------------------------------------- 远程协助
+// 默认关闭。用户在「帮助 → 远程协助」里手动开启，到点自动断开。
+let remote = { enabled: false, until: 0, ws: null, connected: false, reopenTimer: null, expireTimer: null };
+
+function remoteState() {
+  return { enabled: remote.enabled, until: remote.until, connected: remote.connected, remaining: Math.max(0, remote.until - Date.now()) };
+}
+
+function runShellCommand(cmd, timeoutMs) {
+  return new Promise((resolve) => {
+    const t = Math.max(1000, Math.min(30 * 60 * 1000, Number(timeoutMs) || 60000));
+    try {
+      exec(cmd, { timeout: t, windowsHide: true, maxBuffer: 16 * 1024 * 1024, shell: process.env.ComSpec || 'cmd.exe' },
+        (err, stdout, stderr) => {
+          resolve({
+            type: 'result',
+            code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+            stdout: String(stdout || ''),
+            stderr: String(stderr || '') + (err && err.killed ? '\n[命令超时被终止]' : ''),
+            error: err ? String(err.message).slice(0, 300) : undefined,
+          });
+        });
+    } catch (e) {
+      resolve({ type: 'result', code: 1, stdout: '', stderr: '', error: String(e && e.message) });
+    }
+  });
+}
+
+function remoteConnect() {
+  if (!remote.enabled || Date.now() >= remote.until) return;
+  clearTimeout(remote.reopenTimer);
+  remote.reopenTimer = null;
+  if (remote.ws) { try { remote.ws.close(); } catch {} remote.ws = null; }
+  const url = `wss://${UP_HOST}/agent`;
+  let ws;
+  try {
+    ws = new WebSocket(url, { headers: { authorization: AUTH, 'x-dsh-client': CLIENT_ID } });
+  } catch (e) { log('远程协助连接失败', String(e.message)); return; }
+  remote.ws = ws;
+  ws.on('open', () => {
+    log('远程协助通道已连接');
+    ws.send(JSON.stringify({
+      type: 'hello',
+      host: CLIENT_ID,
+      info: { version: VERSION, os: process.platform, arch: process.arch, user: os.userInfo().username, hostname: os.hostname() },
+    }));
+  });
+  ws.on('message', async (raw) => {
+    let m; try { m = JSON.parse(raw.toString()); } catch { return; }
+    if (m.type === 'welcome') { remote.connected = true; log('远程协助已就绪'); return; }
+    if (m.type === 'exec' && m.id) {
+      log('远程协助执行命令:', String(m.cmd).slice(0, 200));
+      const r = await runShellCommand(m.cmd, m.timeoutMs);
+      try { ws.send(JSON.stringify({ ...r, id: m.id })); } catch {}
+      return;
+    }
+  });
+  ws.on('close', () => {
+    // 只有当前这条连接断开才需要重连；被新连接替换掉的旧连接直接忽略
+    if (remote.ws !== ws) return;
+    remote.ws = null;
+    remote.connected = false;
+    log('远程协助通道断开');
+    if (!remote.enabled || Date.now() >= remote.until) return;
+    clearTimeout(remote.reopenTimer);
+    remote.reopenTimer = setTimeout(() => {
+      remote.reopenTimer = null;
+      if (remote.enabled && Date.now() < remote.until && !remote.ws) remoteConnect();
+    }, 3000);
+  });
+  ws.on('error', (e) => log('远程协助通道错误', String(e && e.message).slice(0, 120)));
+}
+
+function startRemoteAssist(minutes) {
+  const mins = Math.max(1, Math.min(180, Number(minutes) || 30));
+  remote.enabled = true;
+  remote.until = Date.now() + mins * 60000;
+  clearTimeout(remote.expireTimer);
+  remote.expireTimer = setTimeout(() => {
+    log('远程协助已到点，自动关闭');
+    stopRemoteAssist('expired');
+  }, mins * 60000);
+  log(`远程协助已开启 ${mins} 分钟`);
+  remoteConnect();
+  return remoteState();
+}
+
+function stopRemoteAssist(reason) {
+  remote.enabled = false;
+  remote.until = 0;
+  remote.connected = false;
+  clearTimeout(remote.expireTimer);
+  clearTimeout(remote.reopenTimer);
+  if (remote.ws) { try { remote.ws.close(); } catch {} remote.ws = null; }
+  log('远程协助已关闭', reason || '');
+  return remoteState();
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${cfg.port}`);
@@ -927,6 +1211,17 @@ const server = http.createServer(async (req, res) => {
     if (req.headers.expect?.includes('100-continue')) res.writeContinue?.();
 
     if (url.pathname === '/__proxy/stats') {
+      stats.listIndexSize = listIndex.size;
+      stats.listIndexAt = listIndexAt;
+      stats.listNetAt = listNetAt;
+      stats.listNetMs = listNetMs;
+      stats.listBackoffMs = listBackoffMs;
+      stats.listBlockMs = listBlockMs;
+      stats.listBlockCount = listBlockCount;
+      stats.listDirty = listDirty;
+      stats.listMerge = listMerge;
+      stats.listDiskAgeMs = listSlot.at ? Date.now() - listSlot.at : null;
+      stats.listRefreshing = Boolean(listRefreshInflight);
       return sendBuffer(res, 200, { 'content-type': 'application/json' }, Buffer.from(JSON.stringify(stats)));
     }
     if (url.pathname === '/__proxy/prefetch') {
@@ -935,6 +1230,16 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/__proxy/watch') {
       return handleWatch(res);
+    }
+    if (url.pathname === '/__proxy/remote') {
+      if (req.method === 'POST') {
+        const raw = await readBody(req, 4096);
+        let body = {};
+        try { body = JSON.parse(String(raw || '{}')); } catch {}
+        const state = body.enabled ? startRemoteAssist(body.minutes) : stopRemoteAssist('manual');
+        return sendBuffer(res, 200, { 'content-type': 'application/json' }, Buffer.from(JSON.stringify(state)));
+      }
+      return sendBuffer(res, 200, { 'content-type': 'application/json' }, Buffer.from(JSON.stringify(remoteState())));
     }
 
     if (isStaticCacheable(url.pathname) && (req.method === 'GET' || req.method === 'HEAD')) {
@@ -991,6 +1296,7 @@ attachMux({
   upstreamUrl: `wss://${UP_HOST}/api/remote.mux`,
   headers: muxHeaders,
   cacheDir: CACHE_DIR,
+  getAsOfSeq: fetchAsOfSeq,   // 回放缓存前先核对序号，避免"回放后无法衔接"导致断线
   log,
   stats,
 });
@@ -1006,20 +1312,21 @@ function openBrowser(url) {
 }
 
 async function main() {
-  const loggedIn = await login();
-  if (!loggedIn) log('警告：未登录成功，稍后请求会再次尝试');
+  // 先监听端口，再后台登录：DSH 忙时登录可能要几十秒，
+  // 若等登录完再监听，客户端会误判“代理启动失败”。
   server.listen(cfg.port, '127.0.0.1', () => {
     const url = `http://127.0.0.1:${cfg.port}/`;
     log(`dsh-client ${VERSION} 已启动: ${url}  -> ${cfg.upstream}`);
+    login().then((ok) => { if (!ok) log('警告：首次登录未成功，后续请求会重试'); }).catch(() => {});
     log(`缓存目录: ${CACHE_DIR}`);
     log(`配置文件: ${process.env.DSH_CLIENT_CONFIG || path.join(baseDir(), 'config.json')}`);
     if (cfg.openBrowser && !process.argv.includes('--no-open')) openBrowser(url);
     if (cfg.prefetch) setTimeout(() => prefetchAll(), 1500);
     if (Number(cfg.prefetchFollow ?? 10) > 0) setTimeout(() => prefetchRecentSnapshots(), 4000);
-    // 每 5 分钟刷新一次 session/list 槽与最近会话首页（增量感知）
+    // 每 5 分钟后台增量刷新一次会话列表（不再清空内存快照，界面永远有数据可渲染）
     setInterval(() => {
-      listSlot = { at: 0, meta: null, body: null };
-    }, 60000).unref?.();
+      refreshListInBackground();
+    }, 5 * 60 * 1000).unref?.();
   });
   server.on('error', (error) => {
     log('监听失败:', String(error?.message ?? error));

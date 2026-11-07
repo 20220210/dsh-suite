@@ -5,6 +5,7 @@ const { app, BrowserWindow, Menu, dialog, shell, Tray, nativeImage, Notification
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const crypto = require('node:crypto');
 const { spawn, spawnSync } = require('node:child_process');
 const { createUpdater } = require('./updater.cjs');
@@ -21,6 +22,8 @@ if (process.env.DSH_DEBUG_CDP === '1') {
 let mainWindow = null;
 let proxyChild = null;
 let CONFIG_PATH = null;
+let remoteUntil = 0;
+let remoteTick = null;
 let updater = null;
 let checkTimer = null;
 let tray = null;
@@ -364,6 +367,42 @@ function promptPassword(reason) {
   });
 }
 
+// 清扫占着本地代理端口的残留进程（应用被强杀后子进程可能变成孤儿）
+function killPortOwner(port) {
+  if (process.platform !== 'win32') return;
+  try {
+    const ps = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+      `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique`],
+      { windowsHide: true, timeout: 8000, encoding: 'utf8' });
+    const pids = String(ps.stdout || '').split(/\s+/).filter((x) => /^\d+$/.test(x));
+    for (const pid of pids) {
+      const info = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+        `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).ProcessName`],
+        { windowsHide: true, timeout: 5000, encoding: 'utf8' });
+      const name = String(info.stdout || '').trim();
+      if (!name) continue;
+      if (!/electron|dsh/i.test(name)) { mainLog(`端口 ${port} 被其它程序占用（${name} pid=${pid}），不处理`); continue; }
+      spawnSync('taskkill.exe', ['/F', '/PID', pid], { windowsHide: true, timeout: 8000 });
+      mainLog(`已清理占用端口 ${port} 的残留进程 ${name} pid=${pid}`);
+    }
+  } catch (e) {
+    mainLog('清理端口占用失败: ' + String(e && e.message ? e.message : e));
+  }
+}
+
+// 端口是否已被监听（比 /__proxy/stats 更宽松，避免误判启动失败）
+function portOpen(port, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let done = false;
+    const sock = net.connect({ host: '127.0.0.1', port });
+    const finish = (ok) => { if (done) return; done = true; try { sock.destroy(); } catch {} resolve(ok); };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error', () => finish(false));
+  });
+}
+
 function startProxy(cfgPath) {
   const proxyScript = path.join(__dirname, 'proxy.mjs');
   const out = fs.createWriteStream(logFile(), { flags: 'a' });
@@ -381,14 +420,17 @@ function startProxy(cfgPath) {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
-  proxyChild.stdout.pipe(out);
-  proxyChild.stderr.pipe(out);
+  // end:false —— 不要把日志流结束掉，否则子进程退出后再写会抛 ERR_STREAM_WRITE_AFTER_END
+  proxyChild.stdout.pipe(out, { end: false });
+  proxyChild.stderr.pipe(out, { end: false });
+  const logLine = (text) => { try { if (!out.writableEnded) out.write(text); } catch {} };
   proxyChild.on('exit', (code) => {
-    out.write(`\n[main] 代理退出 code=${code}\n`);
+    logLine(`\n[main] 代理退出 code=${code}\n`);
   });
   proxyChild.on('error', (error) => {
-    out.write(`\n[main] 代理启动失败: ${error}\n`);
+    logLine(`\n[main] 代理启动失败: ${error}\n`);
   });
+  proxyChild.on('close', () => { try { out.end(); } catch {} });
 }
 
 function stopProxy() {
@@ -727,6 +769,14 @@ function createWindow() {
   });
 
   mainWindow.loadURL(PROXY_URL);
+  // 首页偶尔会因本地代理刚起步/上游忙而加载失败（窗口就一片黑），这里自动重试几次
+  mainWindow.webContents.on('did-fail-load', (_e, errorCode, errorDesc, validatedURL) => {
+    try { mainLog(`页面加载失败 ${errorCode} ${errorDesc} ${validatedURL}，1.5 秒后重试`); } catch {}
+    if (errorCode === -3) return; // 主动 abort（例如重载）不算失败
+    setTimeout(() => {
+      try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(PROXY_URL); } catch {}
+    }, 1500);
+  });
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -830,6 +880,172 @@ async function showProxyStats() {
   }
 }
 
+// ---------------------------------------------------------------- 一键重连
+/** 重启本地代理并刷新页面：用于解决切会话卡死、连接假死，无需退出程序 */
+async function hardReconnect() {
+  mainLog('手动重连：重启本地代理并刷新页面');
+  try { stopProxy(); } catch {}
+  await new Promise((r) => setTimeout(r, 800));
+  try {
+    const running = await proxyInfo();
+    if (running && running.pid) {
+      killStaleProxy(running.pid);
+      await new Promise((r) => setTimeout(r, 700));
+    }
+  } catch {}
+  killPortOwner(19390);
+  await new Promise((r) => setTimeout(r, 300));
+  startProxy(CONFIG_PATH || ensureConfig());
+  const ok = await waitProxy(35000);
+  if (!ok) {
+    dialog.showErrorBox('重连失败', '本地代理没有启动起来，请查看日志：\n' + logFile());
+    return;
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.loadURL(PROXY_URL); } catch {}
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+  remoteNotify('已重连', '本地代理已重启，页面已刷新');
+  mainLog('手动重连完成');
+}
+
+// ---------------------------------------------------------------- 管理员重启
+function isElevatedWindows() {
+  if (process.platform !== 'win32') return false;
+  try {
+    const r = spawnSync('net', ['session'], { windowsHide: true, timeout: 6000 });
+    return r && r.status === 0;
+  } catch { return false; }
+}
+
+function restartAsAdmin() {
+  if (process.platform !== 'win32') return;
+  if (isElevatedWindows()) {
+    dialog.showMessageBox({ type: 'info', title: '以管理员身份重启', message: '当前已经是管理员权限运行，无需重启。' });
+    return;
+  }
+  const opts = {
+    type: 'question',
+    title: '以管理员身份重启',
+    message: '将以管理员权限重新启动 DSH 桌面版？',
+    detail: [
+      '接下来会出现 Windows 的 UAC 提示，需要点「是」。',
+      '',
+      '· 客户端会先退出，约 3 秒后以管理员身份重新打开',
+      '· 取消 UAC 的话不会启动，需要你手动再打开一次',
+      '· 以管理员运行时，远程协助也能执行管理员级操作',
+    ].join('\n'),
+    buttons: ['以管理员重启', '取消'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  };
+  const p = dialog.showMessageBox(opts);
+  p.then((r) => {
+    if (r.response !== 0) return;
+    const exe = process.execPath;
+    const ps = `Start-Sleep -Seconds 3; Start-Process -FilePath '${exe.replace(/'/g, "''")}' -Verb RunAs`;
+    try {
+      spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', ps], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      }).unref();
+    } catch (e) {
+      dialog.showErrorBox('提权重启失败', String(e && e.message));
+      return;
+    }
+    isQuitting = true;
+    setTimeout(() => app.quit(), 600);
+  });
+}
+
+// ---------------------------------------------------------------- 远程协助
+function proxyRequest(method, path, payload) {
+  return new Promise((resolve) => {
+    try {
+      const url = new URL(PROXY_URL + path.replace(/^\//, ''));
+      const body = payload ? JSON.stringify(payload) : null;
+      const req = http.request(
+        { hostname: url.hostname, port: url.port, path: url.pathname, method, timeout: 3000,
+          headers: body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {} },
+        (res) => { let b = ''; res.setEncoding('utf8'); res.on('data', (c) => (b += c)); res.on('end', () => { try { resolve(JSON.parse(b)); } catch { resolve(null); } }); },
+      );
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+      req.on('error', () => resolve(null));
+      if (body) req.write(body);
+      req.end();
+    } catch { resolve(null); }
+  });
+}
+
+function remoteMenuLabel() {
+  const left = remoteUntil - Date.now();
+  if (left <= 0) return '远程协助（已关闭）';
+  const m = Math.floor(left / 60000);
+  const sec = Math.floor((left % 60000) / 1000);
+  return `远程协助（剩余 ${m}:${String(sec).padStart(2, '0')} · 点击关闭）`;
+}
+
+function remoteNotify(title, body) {
+  try { new Notification({ title, body }).show(); } catch {}
+}
+
+async function toggleRemoteAssist() {
+  // 已开启 → 立即关闭
+  if (remoteUntil > Date.now()) {
+    remoteUntil = 0;
+    await proxyRequest('POST', '__proxy/remote', { enabled: false });
+    remoteNotify('远程协助已关闭', '服务器已无法连接本机');
+    buildMenu();
+    return;
+  }
+  const opts = {
+    type: 'warning',
+    title: '远程协助',
+    message: '允许服务器临时连接本机？',
+    detail: [
+      '开启后，服务器可以在本机执行命令（安装更新、查看日志、排查问题等）。',
+      '',
+      '· 时长：30 分钟，到点自动断开',
+      '· 期间可随时点菜单关闭',
+      '· 关闭后服务器无法再连接',
+    ].join('\n'),
+    buttons: ['开启 30 分钟', '取消'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  };
+  const r = mainWindow && !mainWindow.isDestroyed() ? await dialog.showMessageBox(mainWindow, opts) : await dialog.showMessageBox(opts);
+  if (r.response !== 0) return;
+  remoteUntil = Date.now() + 30 * 60 * 1000;
+  const st = await proxyRequest('POST', '__proxy/remote', { enabled: true, minutes: 30 });
+  if (!st) {
+    remoteUntil = 0;
+    dialog.showMessageBox({ type: 'error', message: '远程协助开启失败', detail: '本地代理无响应，请查看日志：' + logFile() });
+    return;
+  }
+  remoteNotify('远程协助已开启', '30 分钟内服务器可连接本机，点「帮助 → 远程协助」可提前关闭');
+  buildMenu();
+}
+
+function ensureRemoteTicker() {
+  if (remoteTick) return;
+  remoteTick = setInterval(async () => {
+    if (remoteUntil && Date.now() >= remoteUntil) {
+      remoteUntil = 0;
+      await proxyRequest('POST', '__proxy/remote', { enabled: false });
+      remoteNotify('远程协助已关闭', '30 分钟已到，服务器无法再连接本机');
+      buildMenu();
+    } else if (remoteUntil) {
+      buildMenu(); // 刷新倒计时
+    }
+  }, 30000);
+  remoteTick.unref?.();
+}
+
 function buildMenu() {
   const template = [
     {
@@ -865,6 +1081,10 @@ function buildMenu() {
       ],
     },
     {
+      label: '重连',
+      click: () => { hardReconnect().catch(() => {}); },
+    },
+    {
       label: '帮助',
       submenu: [
         {
@@ -884,6 +1104,14 @@ function buildMenu() {
         {
           label: '更新访问令牌…',
           click: () => showTokenUpdateHelp(),
+        },
+        {
+          label: remoteMenuLabel(),
+          click: () => { toggleRemoteAssist().catch(() => {}); },
+        },
+        {
+          label: isElevatedWindows() ? '已以管理员身份运行' : '以管理员身份重启…',
+          click: () => restartAsAdmin(),
         },
         {
           label: '创建桌面快捷方式',
@@ -916,6 +1144,13 @@ function buildMenu() {
 }
 
 // ------------------------------------------------ 生命周期
+
+process.on('uncaughtException', (error) => {
+  try { mainLog('未捕获异常（已记录，继续运行）: ' + (error && error.stack ? error.stack : String(error))); } catch {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { mainLog('未处理 Promise 拒绝: ' + String(reason && reason.message ? reason.message : reason)); } catch {}
+});
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -954,6 +1189,7 @@ if (!gotLock) {
     }
 
     buildMenu();
+    ensureRemoteTicker();
     try {
       migrateSecrets();
       hardenAcl();
@@ -986,16 +1222,35 @@ if (!gotLock) {
         killStaleProxy(running.pid);
         await new Promise((r) => setTimeout(r, 800));
       }
+      killPortOwner(19390);      // 清掉可能残留的孤儿代理
+      await new Promise((r) => setTimeout(r, 300));
       startProxy(cfgPath);
     }
-    const ok = await waitProxy(60000);
+    let ok = await waitProxy(60000);
+    if (!ok) {
+      // 重试一次：清掉可能占着端口的旧代理再启动
+      mainLog('代理首次启动失败，清理端口后重试');
+      try {
+        const stale = await proxyInfo().catch(() => null);
+        if (stale && stale.pid) killStaleProxy(stale.pid);
+      } catch {}
+      killPortOwner(19390);
+      await new Promise((r) => setTimeout(r, 1200));
+      stopProxy();
+      startProxy(cfgPath);
+      ok = await waitProxy(45000);
+    }
+    if (!ok && await portOpen(19390)) {
+      // 端口已经在监听：只是状态接口还没就绪，不算失败
+      mainLog('代理端口已监听（状态接口未就绪），按已启动处理');
+      ok = true;
+    }
     if (!ok) {
       dialog.showErrorBox(
         '本地缓存代理启动失败',
-        '请查看日志：\n' + logFile() + '\n\n常见原因：config.json 里的服务器地址/token 不对，或网络不通。',
+        '请查看日志：\n' + logFile() + '\n\n常见原因：config.json 里的服务器地址/密码不对，或网络不通。\n可点菜单「重连」重试。',
       );
-      app.quit();
-      return;
+      return;   // 不再直接退出：保留窗口，让用户能点「重连」
     }
     createWindow();
     startNotifyWatcher();

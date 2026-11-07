@@ -24,6 +24,7 @@ import zlib from 'node:zlib';
 
 const FOLLOW_ENDPOINT = 'session/follow';
 const MAX_CACHE_ITEM_BYTES = 32 * 1024 * 1024;
+const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
 function sha1(text) {
   return crypto.createHash('sha1').update(text).digest('hex');
@@ -52,6 +53,13 @@ function cursorOf(frame) {
 export function attachMux(options) {
   const { server, upstreamUrl, headers, cacheDir, log, stats } = options;
   const dir = path.join(cacheDir, 'ws-follow');
+  // 缓存写入时间（重启后未知 → 当作过期，直接走上游，避免一上来就强制重连）
+  const cacheMeta = new Map();
+  // 某个会话刚发生过“快照无法衔接”后，10 分钟内不再回放缓存（避免反复重连）
+  const resyncBlock = new Map();
+  const CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;  // 缓存可回放 6 小时（回放前会用 asOfSeq 核对，安全）
+  const RESYNC_BLOCK_MS = 10 * 60 * 1000;
+  const MAX_FOLLOW_MESSAGES = FOLLOW_MAX_MESSAGES;
   fs.mkdirSync(dir, { recursive: true });
 
   const wss = new WebSocketServer({
@@ -82,6 +90,7 @@ export function attachMux(options) {
       const tmp = cachePath(key) + '.' + process.pid + '.' + Date.now() + '.tmp';
       fs.writeFileSync(tmp, gz);
       fs.renameSync(tmp, cachePath(key));
+      cacheMeta.set(key, Date.now());
     } catch (error) {
       log?.('follow 缓存写入失败', String(error?.message ?? error));
     }
@@ -142,7 +151,7 @@ export function attachMux(options) {
         } catch {}
         return;
       }
-      const text = data.toString();
+      let text = data.toString();
       let frame;
       try {
         frame = JSON.parse(text);
@@ -201,7 +210,8 @@ export function attachMux(options) {
             // 因此断开这条 mux 连接，让客户端按自己的重连逻辑重新打开（此时允许替换快照）。
             writeCache(track.key, value);
             stats && (stats.wsSnapshotResync = (stats.wsSnapshotResync ?? 0) + 1);
-            log?.('mux 快照无法衔接，触发客户端重连', 'cursor=' + String(cursor) + ' delta=' + String(delta.length));
+            resyncBlock.set(key, Date.now() + RESYNC_BLOCK_MS);
+            log?.('mux 快照无法衔接，触发客户端重连（10 分钟内该会话不再回放缓存）', 'cursor=' + String(cursor) + ' delta=' + String(delta.length));
             try {
               ws.close(1012, 'snapshot resync');
             } catch {}
@@ -232,7 +242,7 @@ export function attachMux(options) {
         sendUpstream(data.toString());
         return;
       }
-      const text = data.toString();
+      let text = data.toString();
       let frame;
       try {
         frame = JSON.parse(text);
@@ -242,7 +252,31 @@ export function attachMux(options) {
       }
 
       if (frame.type === 'open' && frame.endpoint === FOLLOW_ENDPOINT && frame.payload) {
+        // 首屏只取最近 N 条（约 10 轮）：DSH 要解析整份日志，少取能显著加快切会话
+        try {
+          const req0 = frame.payload?.args?.request;
+          if (req0) {
+            const cap = MAX_FOLLOW_MESSAGES;
+            if (req0.maxMessages === undefined || req0.maxMessages > cap) req0.maxMessages = cap;
+            // DSH 要求 turnWindow.minMessages ≤ maxMessages，否则直接 400
+            if (req0.turnWindow && typeof req0.turnWindow.minMessages === 'number') {
+              const m = Math.floor(req0.turnWindow.minMessages);
+              req0.turnWindow.minMessages = Math.max(1, Math.min(m > 0 ? m : 1, req0.maxMessages));
+            }
+            text = JSON.stringify(frame);
+          }
+        } catch {}
         const key = sha1(stable({ endpoint: frame.endpoint, payload: frame.payload }));
+        const cachedAt = cacheMeta.get(key) || 0;
+        const tooOld = !cachedAt || Date.now() - cachedAt > CACHE_MAX_AGE_MS;
+        const blocked = (resyncBlock.get(key) || 0) > Date.now();
+        if (tooOld || blocked) {
+          tracks.set(frame.streamId, { key, mode: 'miss' });
+          stats && (stats.wsSnapshotSkipped = (stats.wsSnapshotSkipped ?? 0) + 1);
+          if (blocked) log?.('mux 该会话刚重连过，跳过缓存回放', 'key=' + key.slice(0, 8));
+          sendUpstream(text);
+          return;
+        }
         const cached = readCache(key);
         if (cached && options.getAsOfSeq) {
           // 先花一次极小请求（~300B）确认会话没有新事件，再回放本地快照；
@@ -340,7 +374,7 @@ export function prefetchFollowSnapshots(options) {
       currentId = sessionIds[index++];
       const payload = {
         args: {
-          request: { address: { kind: 'session', sessionId: currentId }, assistantStream: true },
+          request: { address: { kind: 'session', sessionId: currentId }, assistantStream: true, maxMessages: FOLLOW_MAX_MESSAGES },
         },
       };
       const key = sha1(stable({ endpoint: FOLLOW_ENDPOINT, payload }));
@@ -361,7 +395,7 @@ export function prefetchFollowSnapshots(options) {
       try { frame = JSON.parse(data.toString()); } catch { return; }
       if (frame.type !== 'item' || !frame.value || frame.value.type !== 'snapshot') return;
       const cacheFile = path.join(dir, sha1(stable({ endpoint: FOLLOW_ENDPOINT, payload: {
-        args: { request: { address: { kind: 'session', sessionId: currentId }, assistantStream: true } },
+        args: { request: { address: { kind: 'session', sessionId: currentId }, assistantStream: true, maxMessages: FOLLOW_MAX_MESSAGES } },
       } })) + '.json.gz');
       try {
         const gz = zlib.gzipSync(Buffer.from(JSON.stringify(frame.value), 'utf8'), { level: 3 });
