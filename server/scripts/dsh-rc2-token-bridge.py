@@ -5,6 +5,8 @@
    与 3080 的 /root/dsh-token-bridge.py 同思路，只是数据源换成 rc.2 的日志。"""
 import re
 import subprocess
+import urllib.request
+import urllib.error
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -12,6 +14,7 @@ PORT = 19393
 LOG = "/root/dsh-web-rc2.log"
 TOKEN_RE = re.compile(r"[?&]token=([A-Za-z0-9_-]{16,})")
 CACHE = {"at": 0.0, "token": None}
+COOKIE_CACHE = {"at": 0.0, "cookie": None}
 
 
 def current_token():
@@ -47,8 +50,62 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(buf)
 
+    def rc2_cookie(self):
+        """用 token 登录 rc2，把它的 dsh-auth cookie 取出来（nginx 子请求用，5 分钟缓存）。"""
+        now = time.time()
+        if COOKIE_CACHE["at"] and now - COOKIE_CACHE["at"] < 300 and COOKIE_CACHE["cookie"]:
+            return COOKIE_CACHE["cookie"]
+        token = current_token()
+        if not token:
+            return None
+        try:
+            import urllib.request
+            req = urllib.request.Request("http://127.0.0.1:3081/?token=" + token)
+            # 不让 urllib 自动跟随 303，我们要 Set-Cookie
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **k):
+                    return None
+            opener = urllib.request.build_opener(NoRedirect)
+            try:
+                resp = opener.open(req, timeout=8)
+                headers = resp.headers
+            except urllib.error.HTTPError as e:
+                headers = e.headers
+            raw = headers.get_all("Set-Cookie") or []
+            jar = "; ".join(x.split(";")[0] for x in raw if "=" in x)
+            if jar:
+                COOKIE_CACHE.update(at=now, cookie=jar)
+                return jar
+        except Exception:
+            return None
+        return None
+
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/m2login":
+            # 浏览器带 dshm 来（nginx 已校验），这里把 rc.2 的 cookie 种到浏览器，然后回 /m2/
+            jar = self.rc2_cookie()
+            if not jar:
+                return self._send(503, "cookie unavailable")
+            self.send_response(302)
+            for pair in jar.split("; "):
+                if "=" in pair:
+                    self.send_header("Set-Cookie", pair + "; Path=/; Max-Age=2592000; SameSite=Lax")
+            self.send_header("Location", "/m2/")
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        if path == "/cookie":
+            jar = self.rc2_cookie()
+            if not jar:
+                return self._send(503, "cookie unavailable")
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("x-rc2-cookie", jar)
+            self.send_header("content-length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
         if path in ("/token", "/_dsh/token"):
             token = current_token()
             if not token:

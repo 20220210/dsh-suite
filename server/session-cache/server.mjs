@@ -603,6 +603,70 @@ function healthLine() {
   return `${head} event=${h.eventWatch ? 'up' : 'down'}(${h.eventWatchConnects}/${h.eventWatchFails}) items=${h.items} disk=${h.disk} fp=${h.falsePositive} fn=${h.falseNegative} ageMs=${h.ageMs === null ? '-' : h.ageMs} fullAgeMs=${h.fullAgeMs === null ? '-' : h.fullAgeMs}${h.issues && h.issues.length ? ' issues=' + h.issues.join('|') : ''}`;
 }
 
+// ---------------------------------------------------------------- rc.2 实例（手机 /m2/ 用）
+const RC2_DSH = process.env.DSH_RC2_URL || 'http://127.0.0.1:3081';
+const RC2_BRIDGE = process.env.DSH_RC2_BRIDGE || 'http://127.0.0.1:19393';
+let rc2Cache = { at: 0, items: [] };
+let rc2Cookie = { at: 0, value: '' };
+
+function slimItems(items) {
+  return (Array.isArray(items) ? items : []).map((it) => {
+    const v = it.projections?.values || {};
+    const ss = v.sessionStats || {};
+    return {
+      sessionId: it.sessionId,
+      running: it.running === true,
+      updatedAt: it.updatedAt || 0,
+      cwd: it.cwd || '',
+      blank: it.blank === true,
+      project: {
+        title: v.title || '',
+        turns: ss.turns || 0,
+        decodeMs: ss.decodeMs || 0,
+        decodeTokens: ss.decodeTokens || 0,
+        llmMs: ss.llmMs || 0,
+        toolMs: ss.toolMs || 0,
+        outputTokens: v.tokenUsage?.outputTokens || 0,
+        pressureTokens: v.contextPressure?.pressureTokens || 0,
+        contextWindow: v.contextPressure?.contextWindow || 0,
+        model: v.modelSelection?.next || v.modelSelection?.lastUsed || null,
+        todos: v.todos || null,
+        goal: v.goal?.goal || v.goal || null,
+        agentId: it.agentId || null,
+      },
+    };
+  });
+}
+
+async function rc2CookieValue() {
+  if (rc2Cookie.value && Date.now() - rc2Cookie.at < 4 * 60 * 1000) return rc2Cookie.value;
+  try {
+    const r = await fetch(`${RC2_BRIDGE}/cookie`);
+    if (!r.ok) return rc2Cookie.value || null;
+    const v = r.headers.get('x-rc2-cookie') || '';
+    if (v) { rc2Cookie = { at: Date.now(), value: v }; return v; }
+  } catch {}
+  return rc2Cookie.value || null;
+}
+
+/** rc.2 的会话列表（8 个会话，直接问 3081，~80ms；5 秒内存缓存） */
+async function rc2List() {
+  if (rc2Cache.at && Date.now() - rc2Cache.at < 5000) return rc2Cache.items;
+  const cookie = await rc2CookieValue();
+  if (!cookie) throw new Error('rc2 cookie 不可用');
+  const r = await fetch(`${RC2_DSH}/api/session/list`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie },
+    body: JSON.stringify({ type: 'client-request', rpcId: 'm2', method: 'session/list', payload: { args: { _request: {} } } }),
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error('rc2 返回 ' + r.status);
+  const j = JSON.parse(text);
+  const items = slimItems(j?.result?.value?.items);
+  rc2Cache = { at: Date.now(), items };
+  return items;
+}
+
 // ---------------------------------------------------------------- HTTP
 
 function applyRunningItems(items) {
@@ -625,6 +689,14 @@ function bodyFor(rpcId) {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
+  if (url.pathname === '/m/list' && url.searchParams.get('inst') === 'rc2') {
+    try {
+      const items = await rc2List();
+      return json(res, 200, { ok: true, at: rc2Cache.at, items });
+    } catch (e) {
+      return json(res, 200, { ok: false, error: String(e.message).slice(0, 120), items: [] });
+    }
+  }
   if (url.pathname === '/m/list') {
     if (!cache.body) return json(res, 200, { ok: true, items: [] });
     try {

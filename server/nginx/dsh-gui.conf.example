@@ -1,18 +1,24 @@
 # DSH Web GUI 的公网 HTTPS 入口（只走 nginx 反代，不占用 ssh）
-# 访问: https://dsh.example.com:19306/  需要 Basic Auth 密码 + DSH token
+# 访问: https://tnty.9017i.cc:19306/  需要 Basic Auth 密码 + DSH token
+# 会话列表：优先缓存层，缓存层挂了自动回源 DSH（慢约 100 秒，但不会 502 白屏）
+upstream dsh_session_list {
+    server 127.0.0.1:19402 max_fails=2 fail_timeout=15s;
+    server 127.0.0.1:3080 backup;
+}
+
 server {
     listen 19306 ssl http2;
     listen [::]:19306 ssl http2;
-    server_name dsh.example.com;
+    server_name tnty.9017i.cc;
 
-    ssl_certificate     /etc/nginx/ssl/dsh.example.com.crt;
-    ssl_certificate_key /etc/nginx/ssl/dsh.example.com.key;
+    ssl_certificate     /etc/nginx/ssl/tnty.9017i.cc.crt;
+    ssl_certificate_key /etc/nginx/ssl/tnty.9017i.cc.key;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_timeout 1d;
     ssl_session_cache shared:DSHGUISSL:2m;
 
     # 不记录访问日志：URL 里带 token，避免落盘（诊断已结束）
-    access_log off;
+    access_log /var/log/nginx/dsh-gui.access.log dsh_gui;
 
     # 附件/大文件上传
     client_max_body_size 500m;
@@ -42,6 +48,15 @@ server {
         add_header Cache-Control "no-store";
     }
 
+    # 手机密码登录：用密码换 dshm cookie（无 BasicAuth 凭据时用）
+    location = /_dsh/login {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:19391/login;
+        proxy_set_header Host 127.0.0.1:19391;
+        proxy_set_header X-Real-IP $remote_addr;
+        add_header Cache-Control "no-store";
+    }
+
     location = /_dsh/token {
         auth_request /dshm-check;
         satisfy any;
@@ -53,6 +68,14 @@ server {
 
     # 移动端登录跳板：/m/login?token=xxx -> 代理到 DSH 的 /?token=xxx
     # DSH 会 Set-Cookie 并 303 到 "./"，浏览器相对原 URL 解析 -> 回到 /m/
+    # 手机端错误上报（仅收集诊断信息，不涉及数据）
+    location = /m/err {
+        auth_basic off;
+        proxy_pass http://127.0.0.1:19391/m/err;
+        proxy_set_header Host 127.0.0.1:19391;
+        client_max_body_size 32k;
+    }
+
     location = /m/login {
         auth_request /dshm-check;
         satisfy any;
@@ -60,6 +83,15 @@ server {
         proxy_set_header Host 127.0.0.1:3080;
         proxy_set_header Origin http://127.0.0.1:3080;
         proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # 手机端轻量会话列表（服务器裁剪字段，87KB）
+    location = /m/list {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:19402/m/list;
+        proxy_set_header Host $host;
+        add_header Cache-Control "no-store";
     }
 
     # 移动端 PWA（自建，静态文件；与 DSH 同源，复用 dsh-auth cookie）
@@ -73,6 +105,44 @@ server {
     }
 
     # 客户端安装包下载（同样受 Basic Auth 保护）
+    # 临时免密下载：只放行这两个安装包文件，其它一律 404（用完整段删除）
+    location = /dl/ebf5b18a329bd7b5/dsh-desktop-v1.3.4-win64.zip {
+        auth_basic off;
+        alias /var/www/dsh-downloads/dsh-desktop-v1.3.4-win64.zip;
+        default_type application/octet-stream;
+    }
+    location = /dl/ebf5b18a329bd7b5/app-1.3.4.zip {
+        auth_basic off;
+        alias /var/www/dsh-downloads/app-1.3.4.zip;
+        default_type application/octet-stream;
+    }
+    location /dl/ebf5b18a329bd7b5/ {
+        auth_basic off;
+        return 404;
+    }
+
+    # 手机推送服务（需登录：cookie 或 BasicAuth）
+    # 远程协助通道（WebSocket；需登录，客户端自带 BasicAuth）
+    location /agent {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:19401;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 1d;
+    }
+
+    location /push/ {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:19400;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
     location /downloads/ {
         alias /var/www/dsh-downloads/;
         autoindex off;
@@ -94,6 +164,84 @@ server {
     # 浏览器的 WebSocket 握手不会带 BasicAuth 缓存（Safari/桌面壳都一样），
     # 在 WS 路径上放开 nginx 的 Basic 认证——DSH 自己仍要求 dsh-auth cookie，
     # 没有 cookie 的握手会被 DSH 401 拒绝。
+    # session/list 走本地缓存层（DSH 原生实现要 ~100 秒，缓存后毫秒级）
+    location = /api/session/list {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://dsh_session_list;
+        proxy_next_upstream error timeout http_502 http_503;   # 缓存层异常时回源 backup
+        proxy_read_timeout 300s;
+        proxy_set_header Host $host;
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header Authorization $http_authorization;
+    }
+
+    # rc.2 实例（127.0.0.1:3081）挂在 /rc2/ 下，复用已开放的 19306 端口
+    location = /rc2 { return 302 /rc2/; }
+    location = /rc2/_dsh/token {
+        # 和 3080 的 /_dsh/token 一致：必须带 BasicAuth 或 dshm cookie，否则匿名就能拿到 token
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:19393/token;
+        proxy_set_header Host 127.0.0.1:19393;
+        proxy_set_header X-Real-IP $remote_addr;
+        add_header Cache-Control "no-store";
+    }
+    location /rc2/ {
+        proxy_pass http://127.0.0.1:3081/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host 127.0.0.1:3081;
+        proxy_set_header Origin http://127.0.0.1:3081;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+    }
+
+    # 手机 rc.2 页面：同一份 PWA，走 /m2/ 前缀；API 由 nginx 注入 rc.2 的 cookie
+    location = /m2 { return 302 /m2/; }
+    location /m2/ {
+        auth_basic off;
+        alias /var/www/dsh-mobile/;
+        index index.html;
+        try_files $uri $uri/ /m2/index.html;
+        add_header Cache-Control "no-store";
+    }
+    location = /m2/login {
+        auth_basic off;
+        auth_request /dshm-check;
+        # 没登录（没有 dshm）时先回主手机页登录，登录后 dshm 全局有效，再打开 /m2/ 即可
+        error_page 401 =302 /m/;
+        proxy_pass http://127.0.0.1:19393/m2login;
+        proxy_set_header Host 127.0.0.1:19393;
+        add_header Cache-Control "no-store";
+    }
+    location /m2/api/ {
+        auth_basic off;
+        auth_request /dshm-check;
+        proxy_pass http://127.0.0.1:3081/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header Host 127.0.0.1:3081;
+        proxy_set_header Origin http://127.0.0.1:3081;
+        proxy_buffering off;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+    }
+    location = /m2/m/list {
+        auth_basic off;
+        auth_request /dshm-check;
+        proxy_pass http://127.0.0.1:19402/m/list?inst=rc2;
+        proxy_set_header Host $host;
+        proxy_read_timeout 30s;
+    }
+
     location = /api/remote.mux {
         auth_basic off;
         proxy_pass http://127.0.0.1:3080;
@@ -105,8 +253,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_buffering off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
     }
 
     # 手机直接访问根路径 -> 移动版（电脑不受影响；带 ?token= 的链接不跳）
@@ -126,8 +274,8 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_buffering off;
         proxy_request_buffering off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
         proxy_socket_keepalive on;
     }
 
@@ -150,8 +298,8 @@ server {
         # 流式/长连接：不缓冲、不超时
         proxy_buffering off;
         proxy_request_buffering off;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
         proxy_socket_keepalive on;
     }
 }

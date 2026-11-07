@@ -1,5 +1,9 @@
 'use strict';
 const CE_MODE = localStorage.getItem('dshm.ce') === '1';   // 富文本输入模式（实验）
+// 实例：/m2/ = rc.2 实例（服务器 3081），其它路径 = 主实例。所有 API 自动加前缀。
+const IS_RC2 = location.pathname.startsWith('/m2');
+const API_BASE = IS_RC2 ? '/m2' : '';
+const HOME_PATH = IS_RC2 ? '/m2/' : '/m/';
 
 function showFatal(msg) {
   try {
@@ -17,7 +21,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '137';   // 部署时由脚本替换成时间戳
+const BUILD = '139';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -39,7 +43,7 @@ function toast(msg, ms = 2600) {
 async function rpc(method, args, { retry = true, rpcId } = {}) {
   const envId = rpcId || rid();
   const body = JSON.stringify({ type: 'client-request', rpcId: envId, method, payload: { args: args ?? {} } });
-  const res = await fetch(`/api/${method}`, {
+  const res = await fetch(`${API_BASE}/api/${method}`, {
     method: 'POST', credentials: 'same-origin',
     headers: { 'content-type': 'application/json' }, body,
   });
@@ -83,14 +87,20 @@ async function passwordLogin(pw) {
     // 已经拿到 dshm cookie，再走一次跳板换 DSH 登录 cookie
     const tokRes = await fetch('/_dsh/token', { credentials: 'same-origin', cache: 'no-store' });
     const tok = tokRes.ok ? (await tokRes.text()).trim() : '';
+    if (IS_RC2) { location.replace(HOME_PATH); return; }   // rc.2 由 nginx 注入 cookie，不用主实例跳板
     if (tok && !tok.startsWith('<')) { location.replace('/m/login?token=' + encodeURIComponent(tok)); return; }
-    location.replace('/m/');
+    location.replace(HOME_PATH);
   } catch (e) {
     showGate('登录失败：' + e.message);
   }
 }
 
 async function login() {
+  if (IS_RC2) {
+    // rc.2 实例：让 nginx 用 dshm 换一个 rc.2 的 cookie，再回到 /m2/
+    location.replace('/m2/login');
+    await new Promise(() => {});
+  }
   if (loginAttempted) { showGate('登录失败，请关掉页面重新打开'); throw new Error('未登录'); }
   loginAttempted = true;
   showGate('正在登录…');
@@ -104,6 +114,7 @@ async function login() {
       const inp = $('#gate-pass'); if (inp) inp.focus();
       throw new Error('需要密码');
     }
+    if (IS_RC2) { location.replace(HOME_PATH); await new Promise(() => {}); }
     // 走 nginx 跳板：/m/login?token=… -> DSH 种 30 天 cookie -> 303 回到 /m/
     location.replace('/m/login?token=' + encodeURIComponent(tok));
     await new Promise(() => {});
@@ -141,7 +152,7 @@ const textOf = (content) => (content || []).filter((p) => p?.type === 'text').ma
 
 /* ---------- 工作区流：拿归档集合（电脑端不显示的会话，手机也不显示）---------- */
 function openWorkspaceStream() {
-  const ws = new WebSocket(`wss://${location.host}/api/remote.mux`);
+  const ws = new WebSocket(`wss://${location.host}${API_BASE}/api/remote.mux`);
   ws.onopen = () => ws.send(JSON.stringify({ type: 'open', streamId: 'wks', endpoint: 'workspace/follow', payload: { args: {} } }));
   ws.onmessage = (ev) => {
     let f; try { f = JSON.parse(ev.data); } catch { return; }
@@ -268,7 +279,7 @@ function mapLightItem(it) {
 
 async function fetchSessionList() {
   try {
-    const r = await fetch('/m/list', { cache: 'no-store' });
+    const r = await fetch(`${API_BASE}/m/list`, { cache: 'no-store' });
     const j = await r.json();
     if (j && j.ok && Array.isArray(j.items) && j.items.length) {
       return { items: j.items.map(mapLightItem) };
@@ -745,7 +756,7 @@ function closeSession() {
 
 function openFollow(sessionId) {
   if (state.followWs) { try { state.followWs.close(); } catch {} }
-  const ws = new WebSocket(`wss://${location.host}/api/remote.mux`);
+  const ws = new WebSocket(`wss://${location.host}${API_BASE}/api/remote.mux`);
   ws.__buf = ''; state.followWs = ws;
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'open', streamId: 'follow', endpoint: 'session/follow',
@@ -1655,7 +1666,7 @@ async function sendPrompt() {
 /* ---------- 审批 / 提问（$events） ---------- */
 function openEvents() {
   if (state.ws && state.ws.readyState <= 1) return;
-  const ws = new WebSocket(`wss://${location.host}/api/remote.mux`);
+  const ws = new WebSocket(`wss://${location.host}${API_BASE}/api/remote.mux`);
   state.ws = ws;
   ws.onopen = () => ws.send(JSON.stringify({ type: 'open', streamId: 'ev', endpoint: '$events', payload: { args: {} } }));
   ws.onmessage = (ev) => {
@@ -1933,7 +1944,7 @@ window.addEventListener('resize', syncViewport);
 setTimeout(syncViewport, 0);
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js', { scope: '/m/' })
+  navigator.serviceWorker.register('sw.js', { scope: IS_RC2 ? '/m2/' : '/m/' })
     .then((reg) => reg.update().catch(() => {}))   // 每次打开都检查 SW 是否有更新
     .catch(() => {});
 }
