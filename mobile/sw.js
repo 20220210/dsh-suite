@@ -1,5 +1,5 @@
 // 网络优先 + 离线兜底：普通刷新就能拿到最新文件，不用重装
-const CACHE = 'dsh-m-120';
+const CACHE = 'dsh-m-137';
 const SHELL = ['/m/', '/m/app.js', '/m/style.css', '/m/manifest.webmanifest', '/m/icon-192.png'];
 
 self.addEventListener('install', (e) => {
@@ -11,6 +11,38 @@ self.addEventListener('activate', (e) => {
     const keys = await caches.keys();
     await Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)));
     await self.clients.claim();
+  })());
+});
+
+// 推送通知
+self.addEventListener('push', (e) => {
+  let data = { title: 'DSH', body: '' };
+  try { data = e.data.json(); } catch { try { data = { title: 'DSH', body: e.data.text() }; } catch {} }
+  const opts = {
+    body: data.body || '',
+    icon: '/m/icon-192.png',
+    badge: '/m/icon-192.png',
+    tag: data.tag || undefined,
+    renotify: !!data.tag,
+    data: { sessionId: data.sessionId || null, url: data.sessionId ? '/m/?session=' + encodeURIComponent(data.sessionId) : '/m/' },
+  };
+  e.waitUntil(self.registration.showNotification(data.title || 'DSH', opts));
+});
+
+// 点通知：已开着的窗口直接切会话，否则打开
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const sid = e.notification.data && e.notification.data.sessionId;
+  const target = e.notification.data && e.notification.data.url || '/m/';
+  e.waitUntil((async () => {
+    const list = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const alive = list.find((c) => new URL(c.url).origin === location.origin);
+    if (alive) {
+      alive.postMessage({ type: 'open-session', sessionId: sid });
+      try { await alive.focus(); } catch {}
+      return;
+    }
+    await self.clients.openWindow(target);
   })());
 });
 

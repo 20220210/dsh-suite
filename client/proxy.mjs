@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
@@ -148,6 +148,14 @@ for (const d of [CACHE_DIR, API_DIR, STATIC_DIR]) fs.mkdirSync(d, { recursive: t
 
 let logStream = null;
 try {
+  // 简单轮转：超过 10MB 就转成 .1（只保留一份），避免长期运行后日志无限涨
+  try {
+    const st = fs.statSync(LOG_FILE);
+    if (st.size > 10 * 1024 * 1024) {
+      try { fs.rmSync(LOG_FILE + '.1', { force: true }); } catch {}
+      try { fs.renameSync(LOG_FILE, LOG_FILE + '.1'); } catch {}
+    }
+  } catch {}
   logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
 } catch {}
 function log(...args) {
@@ -465,7 +473,7 @@ function writeApiCache(cacheKey, method, status, headers, body) {
 /** 只读、可缓存的方法；值 = TTL 毫秒（0 = 只要历史不变就一直有效） */
 const CACHE_RULES = {
   'session/list': 15000, // 单独走 slot 缓存
-  'session/page': 0,
+  'session/page': 30 * 24 * 60 * 60 * 1000, // 30 天：原来 0=永久，磁盘会一直涨
   'session/modelCatalog': 60000,
   'settings/describe': 600000,
   'credentials/describe': 600000,
@@ -696,6 +704,101 @@ function refreshListInBackground({ force = false } = {}) {
     }
   })();
   return listRefreshInflight;
+}
+
+// ---------------------------------------------------------------- 缓存容量治理
+const MAX_CACHE_BYTES = Math.max(64, Number(cfg.maxCacheMb || 2048)) * 1024 * 1024;
+const WS_FOLLOW_DIR = path.join(CACHE_DIR, 'ws-follow');
+const WS_FOLLOW_MAX_AGE = 6 * 60 * 60 * 1000;   // 与 ws-mux 回放策略一致：6 小时后没用就删
+
+function walkFiles(dir) {
+  const out = [];
+  let ents;
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of ents) {
+    const full = path.join(dir, e.name);
+    try {
+      if (e.isDirectory()) out.push(...walkFiles(full));
+      else { const st = fs.statSync(full); out.push({ file: full, size: st.size, mtimeMs: st.mtimeMs }); }
+    } catch {}
+  }
+  return out;
+}
+
+function cacheUsage() {
+  let total = 0;
+  let files = 0;
+  for (const dir of [API_DIR, STATIC_DIR, WS_FOLLOW_DIR]) {
+    for (const x of walkFiles(dir)) { total += x.size; files += 1; }
+  }
+  let freeMb = null;
+  try {
+    const sf = fs.statfsSync(CACHE_DIR);
+    freeMb = Math.round((sf.bfree * sf.bsize) / 1048576);
+  } catch {}
+  return { total, files, mb: Math.round((total / 1048576) * 10) / 10, freeMb };
+}
+
+/** 定期清缓存：过期只读缓存、6 小时前的会话快照、超限时按最旧删到 80% 以内 */
+function enforceCacheLimits() {
+  const t0 = Date.now();
+  let removed = 0;
+  let freed = 0;
+  const drop = (x) => {
+    try { fs.rmSync(x.file, { force: true }); removed += 1; freed += x.size; } catch {}
+  };
+  const now = Date.now();
+  // a) API 缓存按各自 TTL 过期删除（session/page 等）
+  for (const x of walkFiles(API_DIR)) {
+    if (!x.file.endsWith('.meta')) continue;
+    let method = null;
+    let at = 0;
+    try {
+      const meta = JSON.parse(fs.readFileSync(x.file, 'utf8'));
+      method = meta.method;
+      at = Number(meta.at) || 0;
+    } catch {}
+    const ttl = method && CACHE_RULES[method] !== undefined ? CACHE_RULES[method] : 30 * 24 * 60 * 60 * 1000;
+    if (ttl <= 0) continue;
+    if (now - at > ttl) {
+      const base = x.file.slice(0, -5);
+      drop(x);
+      try { const st = fs.statSync(base); freed += st.size; } catch {}
+      try { fs.rmSync(base, { force: true }); } catch {}
+    }
+  }
+  // b) ws-follow 快照：超过 6 小时没用就删
+  for (const x of walkFiles(WS_FOLLOW_DIR)) {
+    if (now - x.mtimeMs > WS_FOLLOW_MAX_AGE) drop(x);
+  }
+  // c) 超限：把 api/static/ws-follow 里最旧的文件删到 80%
+  let usage = cacheUsage();
+  if (usage.total > MAX_CACHE_BYTES) {
+    const all = [];
+    for (const dir of [API_DIR, STATIC_DIR, WS_FOLLOW_DIR]) all.push(...walkFiles(dir));
+    all.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    const target = MAX_CACHE_BYTES * 0.8;
+    for (const x of all) {
+      if (usage.total <= target) break;
+      drop(x);
+      usage.total -= x.size;
+    }
+  }
+  stats.cacheMb = Math.round((cacheUsage().total / 1048576) * 10) / 10;
+  stats.cacheFiles = cacheUsage().files;
+  stats.lastCleanup = { at: Date.now(), ms: Date.now() - t0, removed, freedMb: Math.round((freed / 1048576) * 10) / 10, limitMb: Math.round(MAX_CACHE_BYTES / 1048576) };
+  if (removed > 0) log(`缓存清理：删 ${removed} 个文件 / ${stats.lastCleanup.freedMb}MB（上限 ${stats.lastCleanup.limitMb}MB）`);
+  return stats.lastCleanup;
+}
+
+/** 只接受本机主进程发来的写操作：自定义头（跨域会触发预检，浏览器发不出来）+ Origin/Referer 校验 */
+function isLocalCaller(req) {
+  if (String(req.headers['x-dsh-local'] || '') !== '1') return false;
+  const origin = String(req.headers.origin || '');
+  if (origin && !/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin)) return false;
+  const referer = String(req.headers.referer || '');
+  if (referer && !/^http:\/\/(127\.0\.0\.1|localhost):\d+\//.test(referer)) return false;
+  return true;
 }
 
 function staticCachePath(key) {
@@ -1229,6 +1332,28 @@ const server = http.createServer(async (req, res) => {
 
     if (req.headers.expect?.includes('100-continue')) res.writeContinue?.();
 
+    if (url.pathname === '/__proxy/selfcheck') {
+      const u = cacheUsage();
+      const payload = {
+        ok: Boolean(listSlot.body) && !stats.authError,
+        version: VERSION,
+        port: cfg.port,
+        upstream: cfg.upstream,
+        uptimeSec: Math.round((Date.now() - stats.startedAt) / 1000),
+        authError: Boolean(stats.authError),
+        listIndexSize: listIndex.size,
+        listDirty: Boolean(listDirty),
+        listBlockCount: stats.listBlockCount,
+        listBackoffMs: listBackoffMs,
+        cacheDir: CACHE_DIR,
+        cacheMb: u.mb,
+        cacheFiles: u.files,
+        cacheLimitMb: Math.round(MAX_CACHE_BYTES / 1048576),
+        diskFreeMb: u.freeMb,
+        lastCleanup: stats.lastCleanup || null,
+      };
+      return sendBuffer(res, 200, { 'content-type': 'application/json' }, Buffer.from(JSON.stringify(payload)));
+    }
     if (url.pathname === '/__proxy/stats') {
       stats.listIndexSize = listIndex.size;
       stats.listIndexAt = listIndexAt;
@@ -1251,6 +1376,10 @@ const server = http.createServer(async (req, res) => {
       return handleWatch(res);
     }
     if (url.pathname === '/__proxy/remote') {
+      if (req.method === 'POST' && !isLocalCaller(req)) {
+        // 防 CSRF/跨站：浏览器页面发不出带自定义头的请求，本机主进程才行
+        return sendBuffer(res, 403, { 'content-type': 'application/json' }, Buffer.from('{"ok":false,"error":"local-only"}'));
+      }
       if (req.method === 'POST') {
         const raw = await readBody(req, 4096);
         let body = {};
@@ -1340,6 +1469,9 @@ async function main() {
     log(`缓存目录: ${CACHE_DIR}`);
     log(`配置文件: ${process.env.DSH_CLIENT_CONFIG || path.join(baseDir(), 'config.json')}`);
     if (cfg.openBrowser && !process.argv.includes('--no-open')) openBrowser(url);
+    // 缓存容量治理：启动 5 秒后清一次，之后每 30 分钟一次
+    setTimeout(() => { try { enforceCacheLimits(); } catch (e) { log('缓存清理异常', String(e && e.message).slice(0, 120)); } }, 5000);
+    setInterval(() => { try { enforceCacheLimits(); } catch {} }, 30 * 60 * 1000).unref?.();
     if (cfg.prefetch) setTimeout(() => prefetchAll(), 1500);
     if (Number(cfg.prefetchFollow ?? 10) > 0) setTimeout(() => prefetchRecentSnapshots(), 4000);
     // 每 5 分钟后台增量刷新一次会话列表（不再清空内存快照，界面永远有数据可渲染）

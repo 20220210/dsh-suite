@@ -17,7 +17,8 @@
     <button id="back" class="icon" hidden aria-label="返回">‹</button>
     <div id="title">DSH</div>
     <span id="ver"></span>
-    <button id="refresh" class="icon" aria-label="刷新">⟳</button>
+    <button id="bell" class="icon" aria-label="通知">🔕</button>
+    <button id="newchat" class="icon" aria-label="新建对话">＋</button>
   </header>
 
   <section id="view-list" class="view">
@@ -28,6 +29,7 @@
   <section id="view-chat" class="view" hidden>
     <button id="modelbar" type="button"><span id="modelname">模型</span> <span class="caret">▾</span></button>
     <div id="stats"></div>
+    <div id="ptr2">下拉刷新</div>
     <div id="messages"></div>
     <button id="jumpbtn" type="button" hidden>↓</button>
     <div id="pending"></div>
@@ -80,7 +82,9 @@
     <div class="gate-box">
       <div class="gate-title">需要登录</div>
       <div class="gate-text" id="gate-text">请输入访问密码</div>
+      <input id="gate-pass" type="password" placeholder="访问密码" autocomplete="current-password">
       <button id="gate-btn">登录</button>
+      <button id="gate-offline" class="ghost">离线查看缓存</button>
     </div>
   </div>
   <div id="toast" hidden></div>

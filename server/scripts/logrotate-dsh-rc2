@@ -1,0 +1,10 @@
+/root/dsh-web-rc2.log {
+    daily
+    size 50M
+    rotate 5
+    missingok
+    notifempty
+    copytruncate
+    compress
+    delaycompress
+}

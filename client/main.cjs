@@ -1011,7 +1011,7 @@ function proxyRequest(method, path, payload) {
       const body = payload ? JSON.stringify(payload) : null;
       const req = http.request(
         { hostname: url.hostname, port: url.port, path: url.pathname, method, timeout: 3000,
-          headers: body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {} },
+          headers: { 'x-dsh-local': '1', ...(body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : {}) } },
         (res) => { let b = ''; res.setEncoding('utf8'); res.on('data', (c) => (b += c)); res.on('end', () => { try { resolve(JSON.parse(b)); } catch { resolve(null); } }); },
       );
       req.on('timeout', () => req.destroy(new Error('timeout')));
@@ -1087,6 +1087,48 @@ function ensureRemoteTicker() {
   remoteTick.unref?.();
 }
 
+/** 清理 updater 目录：stage-*（下载包）只留最新 1 个；apply-*（含 backup-app）只留最新 1 个 */
+function cleanupUpdaterDirs() {
+  try {
+    const work = path.join(process.env.LOCALAPPDATA || userDataDir(), 'dsh-client', 'updater');
+    if (!fs.existsSync(work)) return;
+    const dirs = [];
+    for (const name of fs.readdirSync(work)) {
+      const full = path.join(work, name);
+      try {
+        const st = fs.statSync(full);
+        if (st.isDirectory()) dirs.push({ name, mtime: st.mtimeMs, full });
+      } catch {}
+    }
+    dirs.sort((a, b) => b.mtime - a.mtime);
+    let stageKept = 0;
+    let applyKept = 0;
+    for (const d of dirs) {
+      if (d.name.startsWith('stage-')) {
+        if (stageKept++ >= 1) fs.rmSync(d.full, { recursive: true, force: true });
+      } else if (d.name.startsWith('apply-')) {
+        if (applyKept++ >= 1) fs.rmSync(d.full, { recursive: true, force: true });
+      }
+    }
+  } catch (e) {
+    mainLog('清理更新目录失败 ' + String(e && e.message));
+  }
+}
+
+/** 找一个空闲的本机端口（给多实例用，端口被别的软件占时顺延） */
+function pickFreePort(startPort) {
+  return new Promise((resolve) => {
+    const tryPort = (p, left) => {
+      if (left <= 0) return resolve(null);
+      portOpen(p, 600).then((busy) => {
+        if (!busy) resolve(p);
+        else tryPort(p + 1, left - 1);
+      }).catch(() => resolve(null));
+    };
+    tryPort(startPort, 20);
+  });
+}
+
 /** 「实例」菜单项：每个实例一个单选项，点击切换窗口指向的本地代理 */
 function buildInstanceMenuItems() {
   return instances.map((x, i) => ({
@@ -1107,6 +1149,12 @@ async function switchInstance(i) {
   let alive = false;
   try { alive = await proxyAlive(i); } catch {}
   if (!alive) {
+    if (await portOpen(it.port)) {
+      const free = await pickFreePort(it.port + 1);
+      if (!free) { dialog.showErrorBox('切换实例失败', `端口 ${it.port} 被其它程序占用，且找不到空闲端口`); return; }
+      mainLog(`实例「${it.name}」端口 ${it.port} 被占用，改用 ${free}`);
+      it.port = free;
+    }
     killPortOwner(it.port);
     await new Promise((r) => setTimeout(r, 300));
     startProxy(CONFIG_PATH || ensureConfig(), i);
@@ -1271,6 +1319,7 @@ if (!gotLock) {
 
     buildMenu();
     ensureRemoteTicker();
+    cleanupUpdaterDirs();
     try {
       migrateSecrets();
       hardenAcl();
@@ -1342,6 +1391,11 @@ if (!gotLock) {
         const it = inst(i);
         try {
           if (await proxyAlive(i)) { mainLog(`实例「${it.name}」代理已在监听 :${it.port}`); return; }
+          if (await portOpen(it.port)) {
+            const free = await pickFreePort(it.port + 1);
+            if (free) { mainLog(`实例「${it.name}」端口 ${it.port} 被她程序占用，改用 ${free}`); it.port = free; }
+            else { mainLog(`实例「${it.name}」找不到可用端口，跳过`); return; }
+          }
           killPortOwner(it.port);
           startProxy(CONFIG_PATH || ensureConfig(), i);
           const okExtra = await waitProxy(45000, i);
