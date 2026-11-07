@@ -1,5 +1,5 @@
 // 网络优先 + 离线兜底：普通刷新就能拿到最新文件，不用重装
-const CACHE = 'dsh-m-140';
+const CACHE = 'dsh-m-146';
 const SHELL = ['/m/', '/m/app.js', '/m/style.css', '/m/manifest.webmanifest', '/m/icon-192.png'];
 
 self.addEventListener('install', (e) => {
@@ -24,7 +24,12 @@ self.addEventListener('push', (e) => {
     badge: '/m/icon-192.png',
     tag: data.tag || undefined,
     renotify: !!data.tag,
-    data: { sessionId: data.sessionId || null, url: data.sessionId ? '/m/?session=' + encodeURIComponent(data.sessionId) : '/m/' },
+    data: {
+      sessionId: data.sessionId || null,
+      inst: data.inst || 'main',
+      url: (data.inst === 'rc2' ? '/m/?inst=rc2' : '/m/?inst=main') +
+           (data.sessionId ? '&session=' + encodeURIComponent(data.sessionId) : ''),
+    },
   };
   e.waitUntil(self.registration.showNotification(data.title || 'DSH', opts));
 });
