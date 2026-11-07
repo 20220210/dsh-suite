@@ -1,0 +1,16 @@
+[Unit]
+Description=DSH rc.2 手机推送监听（把 rc.2 的回合结束/审批/提问转发给推送服务）
+After=network.target dsh-push.service dsh-rc2.service dsh-rc2-token-bridge.service
+Wants=dsh-push.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/push-service
+ExecStart=/usr/bin/env node /root/push-service/rc2-watcher.mjs
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

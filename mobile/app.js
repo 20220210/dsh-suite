@@ -2,6 +2,9 @@
 const CE_MODE = localStorage.getItem('dshm.ce') === '1';   // 富文本输入模式（实验）
 // 实例：可在顶部按钮切换（localStorage 记住）；/m2/ 路径强制 rc.2。所有 API 自动加前缀。
 const PATH_RC2 = location.pathname.startsWith('/m2');
+// 推送点击会带 ?inst=rc2|main，先把这个显式意图写进本地，再决定实例
+const URL_INST = new URLSearchParams(location.search).get('inst');
+if (URL_INST === 'rc2' || URL_INST === 'main') { try { localStorage.setItem('dshm.inst', URL_INST); } catch {} }
 let INSTANCE = PATH_RC2 ? 'rc2' : (localStorage.getItem('dshm.inst') === 'rc2' ? 'rc2' : 'main');
 const IS_RC2 = INSTANCE === 'rc2';
 const API_BASE = IS_RC2 ? '/m2' : '';
@@ -43,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '140';   // 部署时由脚本替换成时间戳
+const BUILD = '146';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -213,14 +216,19 @@ function paintSessionList(items, fromCache) {
   const box = $('#sessions');
   if (!box) return;
   // 数据指纹：完全相同时不重建 DOM（避免返回列表时整块重绘导致手滑不动）
+  // 注意：展开/收起状态、置顶集合也必须进指纹，否则“展开剩余 N 个”点了不会重绘（历史 bug）
   const sig = items.map((it) => it.sessionId + '|' + (it.updatedAt || 0) + '|' + (it.running ? 1 : 0) +
     '|' + (it.projections?.values?.title || '') + '|' + (it.projections?.values?.sessionStats?.turns || 0)).join(',')
-    + '#' + fromCache;
+    + '#' + fromCache
+    + '#' + Array.from(state.expandedGroups || []).sort().join('|')
+    + '#' + Array.from(state.pinned || []).sort().join('|');
   if (sig === state.listSig) return;
   // 手指正在屏幕上：等松手后再重建
   if (state.touching) { state.pendingListPaint = () => paintSessionList(items, fromCache); return; }
   state.listSig = sig;
   state.pendingListPaint = null;
+  // 重绘前记住滚动位置：列表刷新时若把 scrollTop 清零，用户正在滑的第一下会被"吞掉"
+  const keepTop = box.scrollTop;
   box.replaceChildren();
   if (!items.length) { box.append(el('div', 'empty', '还没有会话')); return; }
   if (fromCache) box.append(el('div', 'cached-hint', '显示的是上次的列表，正在刷新…'));
@@ -271,6 +279,7 @@ function paintSessionList(items, fromCache) {
       box.append(more);
     }
   }
+  if (keepTop > 0) { box.scrollTop = keepTop; state.listScroll = keepTop; }
 }
 
 // 轻量列表（服务器侧裁剪，87KB 而不是 1.95MB，iPhone 解析不卡）
@@ -757,20 +766,64 @@ function showView(name) {
   $('#view-list').hidden = chat;
   $('#back').hidden = !chat;
   const nc = $('#newchat'); if (nc) nc.hidden = chat;
-  if (!chat) { $('#title').textContent = 'DSH'; stopTicker(); }
+  if (!chat) {
+    $('#title').textContent = 'DSH'; stopTicker();
+    // iOS 上 display:none 恢复显示后，滚动层要等一次布局才吃手势（表现为「第一下滑不动」）。
+    // 这里强制 reflow + 微调 1px 把滚动层唤醒，再把位置还原。
+    const box = $('#sessions');
+    if (box) {
+      void box.offsetHeight;
+      const want = Math.max(0, state.listScroll || 0);
+      box.scrollTop = want;
+      requestAnimationFrame(() => {
+        box.scrollTop = want + 1;
+        requestAnimationFrame(() => { box.scrollTop = want; });
+      });
+      armFirstTouchProbe();
+    }
+  }
+}
+
+/** 诊断用：回到列表后第一次触摸如果 400ms 内没产生滚动，上报一次 */
+function armFirstTouchProbe() {
+  const box = $('#sessions');
+  if (!box) return;
+  const startTop = box.scrollTop;
+  let done = false;
+  const onMove = () => {
+    if (done) return;
+    done = true;
+    setTimeout(() => {
+      box.removeEventListener('touchmove', onMove);
+      if (Math.abs(box.scrollTop - startTop) < 2) reportErr('first-touch-no-scroll build=' + BUILD);
+    }, 400);
+  };
+  box.addEventListener('touchmove', onMove, { passive: true, once: true });
 }
 
 function closeSession() {
+  const t0 = (performance && performance.now) ? performance.now() : Date.now();
   if (state.followWs) { try { state.followWs.close(); } catch {} state.followWs = null; }
   showView('list');
+  const t1 = (performance && performance.now) ? performance.now() : Date.now();
   $('#title').textContent = 'DSH'; $('#pending').replaceChildren();
   state.view = 'list'; state.sessionId = null;
-  // 恢复之前的滚动位置（列表 DOM 本来就在，不需要重建）
   requestAnimationFrame(() => {
-    const box = $('#sessions');
-    if (box && state.listScroll > 0) box.scrollTop = state.listScroll;
+    // 回到列表后再把聊天 DOM 清空（释放大快照/图片的内存与合成层，避免 iOS 卡几秒）
+    setTimeout(() => {
+      try {
+        if (state.view !== 'list') return;
+        const box2 = $('#messages'); if (box2) box2.replaceChildren();
+        const others = ['#tasks', '#goalbar', '#queue', '#thumbs', '#pending'];
+        for (const sel of others) { const e2 = $(sel); if (e2) { e2.replaceChildren(); e2.hidden = true; } }
+        rendered.clear();
+        const t2 = (performance && performance.now) ? performance.now() : Date.now();
+        const total = t2 - t0;
+        if (total > 500) reportErr('slow-back total=' + Math.round(total) + 'ms show=' + Math.round(t1 - t0) + 'ms clear=' + Math.round(t2 - (t1 + 0)));
+      } catch {}
+    }, 0);
   });
-  // 列表数据延迟刷新：先保证能立刻滑动，不被重绘卡住
+  // 列表数据延迟刷新：先保证能立刻滑动，不被重绘卡住；用户又点进会话就不刷了
   setTimeout(() => {
     if (state.view === 'list' && !state.touching) loadSessions().catch(() => {});
   }, 600);
@@ -789,7 +842,12 @@ function openFollow(sessionId) {
     if (f.type === 'item' && f.streamId === 'follow') onFollowValue(f.value);
     else if (f.type === 'error') toast('对话流错误：' + (f.error?.message || ''), 6000);
   };
-  ws.onopen = ((orig) => () => { state.followRetry = 0; state.connState = 'ok'; renderStats(); orig(); })(ws.onopen);
+  ws.onopen = ((orig) => () => {
+    state.connState = 'ok'; renderStats();
+    clearTimeout(state.followStableTimer);
+    state.followStableTimer = setTimeout(() => { state.followRetry = 0; }, 5000);
+    orig();
+  })(ws.onopen);
   ws.onclose = () => {
     state.connState = 'reconnecting'; renderStats();
     if (state.view !== 'chat' || state.sessionId !== sessionId) { state.connState = 'ok'; return; }
@@ -817,6 +875,21 @@ function onFollowValue(v) {
   if (v.type === 'assistant-stream') { onAssistantStream(v.frame); return; }
 }
 
+/** 按事件 seq 插入节点：重连/补发的事件可能乱序到达，按 seq 保证顺序（用户消息不会被放到思考行下面） */
+function placeNode(box, node, seq) {
+  if (seq) node.dataset.seq = String(seq);
+  if (!seq) { box.appendChild(node); return node; }
+  let ref = null;
+  for (let i = box.children.length - 1; i >= 0; i -= 1) {
+    const c = box.children[i];
+    const cs = Number(c.dataset && c.dataset.seq);
+    if (!cs) continue;
+    if (cs <= seq) { ref = c.nextSibling; break; }
+  }
+  if (ref) box.insertBefore(node, ref); else box.appendChild(node);
+  return node;
+}
+
 function renderRecord(rec, box) {
   const e = rec.event || rec;            // snapshot: {type:'event',event:{...}}  live: {type:'event',...}?
   if (!e || e.type === undefined) return;
@@ -840,7 +913,7 @@ function renderRecord(rec, box) {
         const b = el('div', 'msg user');
         b.append(document.createTextNode(txt));
         b.append(makeFoot({ text: txt, time: e.time }));
-        box.append(b);
+        placeNode(box, b, e.seq);
       }
       break;
     }
@@ -859,7 +932,7 @@ function renderRecord(rec, box) {
         sum.textContent = '已完成 · ' + think.length + ' 字 ⌄';
         const body = el('div', 'think-body', think.slice(0, 60000));
         det.append(sum, body);
-        box.append(det);
+        placeNode(box, det, e.seq);
       }
       if (!txt) break;
       const bubble = el('div', 'msg bot md');
@@ -871,7 +944,7 @@ function renderRecord(rec, box) {
         messageId: d.message?.id,
         time: e.time,
       }));
-      box.append(bubble);
+      placeNode(box, bubble, e.seq);
       break;
     }
     case 'step/start': state.turnSteps++; state.thinkPhase = 'thinking'; state.toolLabel = ''; break;
@@ -898,8 +971,9 @@ function renderRecord(rec, box) {
         const list = el('div', 'tool-list');
         det.append(sum, list);
         // 紧跟在动态状态行后面
+        det.dataset.seq = String(e.seq || 0);
         if (state.thinkRow?.el?.parentNode === box) state.thinkRow.el.after(det);
-        else box.append(det);
+        else placeNode(box, det, e.seq);
         state.toolRow = { el: det, sum, list, count: 0 };
       }
       state.toolRow.count += 1;
@@ -910,8 +984,8 @@ function renderRecord(rec, box) {
       renderStats();
       break;
     }
-    case 'approval/asked': box.append(el('div', 'msg sys', '请求授权：' + (d.toolName || d.tool || ''))); break;
-    case 'approval/decided': box.append(el('div', 'msg sys', '授权结果：' + (d.outcome || ''))); break;
+    case 'approval/asked': placeNode(box, el('div', 'msg sys', '请求授权：' + (d.toolName || d.tool || '')), e.seq); break;
+    case 'approval/decided': placeNode(box, el('div', 'msg sys', '授权结果：' + (d.outcome || '')), e.seq); break;
     case 'turn/start': {
       setRunning(true);
       state.thinkRow = null;
@@ -922,7 +996,7 @@ function renderRecord(rec, box) {
       state.toolRow = null;
       state.thinkPhase = 'thinking';
       state.toolLabel = '';
-      state.thinkRow = makeThinkRow(box);
+      state.thinkRow = makeThinkRow(box, e.seq);
       if (state.thinkRow) state.thinkRow.summary.textContent = '思考中…';
       renderStats();
       break;
@@ -932,7 +1006,7 @@ function renderRecord(rec, box) {
       clearLiveBubbles();   // 跑完就别留闪动的光标记号
       if (state.turnStart) {
         const dur = (e.time || Date.now()) - state.turnStart;
-        box.append(el('div', 'msg sys', `本轮用时 ${fmtDur(dur)}`));
+        placeNode(box, el('div', 'msg sys', `本轮用时 ${fmtDur(dur)}`), e.seq);
         state.turnStart = null;
         renderStats();
       }
@@ -1404,7 +1478,7 @@ function renderThinkSummary() {
   }
 }
 
-function makeThinkRow() {
+function makeThinkRow(seq) {
   const box = $('#messages');
   if (!box) return null;
   const det = document.createElement('details');
@@ -1413,9 +1487,9 @@ function makeThinkRow() {
   summary.textContent = '深度求索中…';
   const body = el('div', 'think-body');
   det.append(summary, body);
-  box.append(det);
+  placeNode(box, det, seq || 0);
   scrollBottom(true);
-  return { el: det, summary, body, chars: 0, streamed: 0 };
+  return { el: det, summary, body, chars: 0, streamed: 0, seq: seq || 0 };
 }
 
 function clearThinkLine() {
