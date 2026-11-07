@@ -17,7 +17,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '120';   // 部署时由脚本替换成时间戳
+const BUILD = '137';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -27,7 +27,8 @@ const el = (tag, cls, txt) => { const n = document.createElement(tag); if (cls) 
 const rid = () => 'w-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 const nowTZ = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
-const state = { workspaces: [], expandedGroups: new Set(), pinned: new Set(), archived: new Set(), view: 'list', sessions: [], sessionId: null, clientId: null, pending: new Map(), ws: null, followWs: null, live: null, running: false, mode: 'steer', images: [], files: [], toolCount: 0, toolRow: null, shownRpc: new Set(), queue: [], thinkRow: null, thinkPhase: 'thinking', toolLabel: '', catalog: null, model: null, stats: null, turnStart: null, turnSteps: 0, ticker: null, followRetry: 0, wsRetry: 0, connState: 'ok' };
+const pendingDeepLink = new URLSearchParams(location.search).get('session');
+const state = { listScroll: 0, touching: false, listSig: '', workspaces: [], expandedGroups: new Set(), pinned: new Set(), archived: new Set(), view: 'list', sessions: [], sessionId: null, clientId: null, pending: new Map(), ws: null, followWs: null, live: null, running: false, mode: 'steer', images: [], files: [], toolCount: 0, toolRow: null, shownRpc: new Set(), queue: [], thinkRow: null, thinkPhase: 'thinking', toolLabel: '', catalog: null, model: null, stats: null, turnStart: null, turnSteps: 0, ticker: null, followRetry: 0, wsRetry: 0, connState: 'ok' };
 
 function toast(msg, ms = 2600) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
@@ -56,6 +57,7 @@ let loginAttempted = false;
 /* 启动时保证 dshm cookie 存在：这个 cookie 是"BasicAuth 只输一次"的关键。
    之前只在 401 时才取 token，所以老用户从没触发过发 cookie 的请求，重开就又要 BasicAuth。 */
 function showGate(msg) {
+  reportErr('gate: ' + msg);
   const g = $('#gate'); if (!g) return;
   const t = $('#gate-text');
   if (t) t.textContent = msg || '请输入访问密码';
@@ -69,13 +71,39 @@ async function ensureAuthCookie() {
   try { await fetch('/_dsh/token', { credentials: 'same-origin', cache: 'no-store' }); } catch {}
 }
 
+async function passwordLogin(pw) {
+  try {
+    showGate('正在登录…');
+    const r = await fetch('/_dsh/login', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ user: 'dsh', pass: pw }),
+    });
+    if (!r.ok) { showGate('密码不正确，请重新输入'); return; }
+    // 已经拿到 dshm cookie，再走一次跳板换 DSH 登录 cookie
+    const tokRes = await fetch('/_dsh/token', { credentials: 'same-origin', cache: 'no-store' });
+    const tok = tokRes.ok ? (await tokRes.text()).trim() : '';
+    if (tok && !tok.startsWith('<')) { location.replace('/m/login?token=' + encodeURIComponent(tok)); return; }
+    location.replace('/m/');
+  } catch (e) {
+    showGate('登录失败：' + e.message);
+  }
+}
+
 async function login() {
   if (loginAttempted) { showGate('登录失败，请关掉页面重新打开'); throw new Error('未登录'); }
   loginAttempted = true;
   showGate('正在登录…');
   try {
-    const tok = (await (await fetch('/_dsh/token', { credentials: 'same-origin' })).text()).trim();
-    if (!tok) throw new Error('拿不到令牌');
+    const res = await fetch('/_dsh/token', { credentials: 'same-origin', cache: 'no-store' });
+    const tok = (await res.text()).trim();
+    if (!res.ok || !tok || tok.startsWith('<')) {
+      // 没有 BasicAuth 凭据 / cookie 失效：让用户输密码
+      loginAttempted = false;
+      showGate('需要访问密码（输一次即可长期免登录）');
+      const inp = $('#gate-pass'); if (inp) inp.focus();
+      throw new Error('需要密码');
+    }
     // 走 nginx 跳板：/m/login?token=… -> DSH 种 30 天 cookie -> 303 回到 /m/
     location.replace('/m/login?token=' + encodeURIComponent(tok));
     await new Promise(() => {});
@@ -85,6 +113,21 @@ async function login() {
     throw e;
   }
 }
+
+/* ---------- 错误上报（诊断用） ---------- */
+let lastErrAt = 0;
+function reportErr(msg, err) {
+  try {
+    const now = Date.now();
+    if (now - lastErrAt < 2000) return;
+    lastErrAt = now;
+    const stack = err && err.stack ? String(err.stack).slice(0, 900) : '';
+    const body = JSON.stringify({ m: String(msg).slice(0, 400), stack, v: BUILD, t: now, u: location.href, sw: !!navigator.serviceWorker?.controller });
+    navigator.sendBeacon ? navigator.sendBeacon('/m/err', body) : fetch('/m/err', { method: 'POST', body, keepalive: true }).catch(() => {});
+  } catch {}
+}
+window.addEventListener('error', (e) => reportErr('error: ' + (e.message || '') + ' @' + (e.filename || '') + ':' + (e.lineno || 0)));
+window.addEventListener('unhandledrejection', (e) => reportErr('reject: ' + ((e.reason && (e.reason.message || e.reason)) || 'unknown')));
 
 /* ---------- 工具 ---------- */
 function fmtTime(ms) {
@@ -123,6 +166,7 @@ function openWorkspaceStream() {
       changed = true;
     }
     if (changed) {
+      saveWorkspacesCache();
       if (state.archivedReady) state.archivedReady();
       if (state.view === 'list') loadSessions().catch(() => {});
     }
@@ -131,23 +175,35 @@ function openWorkspaceStream() {
 }
 
 /* ---------- 会话列表 ---------- */
-async function loadSessions() {
-  const value = await rpc('session/list', { _request: {} });
-  const items = (value?.items || [])
-    .filter((it) => !state.archived.has(it.sessionId))          // 归档会话不显示（和电脑端一致）
-    .filter((it) => it.blank !== true)                          // 空白会话不显示（电脑端也不显示）
-    .slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  state.sessions = items;
-  const box = $('#sessions'); box.replaceChildren();
-  if (!items.length) { box.append(el('div', 'empty', '还没有会话')); return; }
 
-  // 按工作区分组（和电脑端侧栏一致）
-  const wsOf = (sid) => state.workspaces.find((w) => w.sessionIds.has(sid));
+function paintSessionList(items, fromCache) {
+  const box = $('#sessions');
+  if (!box) return;
+  // 数据指纹：完全相同时不重建 DOM（避免返回列表时整块重绘导致手滑不动）
+  const sig = items.map((it) => it.sessionId + '|' + (it.updatedAt || 0) + '|' + (it.running ? 1 : 0) +
+    '|' + (it.projections?.values?.title || '') + '|' + (it.projections?.values?.sessionStats?.turns || 0)).join(',')
+    + '#' + fromCache;
+  if (sig === state.listSig) return;
+  // 手指正在屏幕上：等松手后再重建
+  if (state.touching) { state.pendingListPaint = () => paintSessionList(items, fromCache); return; }
+  state.listSig = sig;
+  state.pendingListPaint = null;
+  box.replaceChildren();
+  if (!items.length) { box.append(el('div', 'empty', '还没有会话')); return; }
+  if (fromCache) box.append(el('div', 'cached-hint', '显示的是上次的列表，正在刷新…'));
+
   const used = new Set();
   const groups = [];
   for (const w of state.workspaces) {
-    const list = items.filter((it) => w.sessionIds.has(it.sessionId));
-    if (list.length) { groups.push({ title: w.title, path: w.path, list }); list.forEach((x) => used.add(x.sessionId)); }
+    const rawIds = w.sessionIds;
+    const ids = rawIds && typeof rawIds.has === 'function'
+      ? rawIds
+      : new Set(Array.isArray(rawIds) ? rawIds : []);
+    const list = items.filter((it) => ids.has(it.sessionId));
+    if (list.length) {
+      groups.push({ title: w.title, path: w.path, list });
+      list.forEach((x) => used.add(x.sessionId));
+    }
   }
   const rest = items.filter((it) => !used.has(it.sessionId));
   if (rest.length) groups.push({ title: '未分组', path: '', list: rest });
@@ -163,41 +219,98 @@ async function loadSessions() {
     const h = el('div', 'ws-group');
     h.append(el('span', 'ws-title', g.title));
     if (g.path) h.append(el('span', 'ws-path', g.path));
+    const addBtn = el('button', 'ws-add', '＋');
+    addBtn.title = '在工作区 ' + g.title + ' 新建对话';
+    const wsInfo = state.workspaces.find((w) => (w.path || w.title) + '' === key);
+    addBtn.onclick = (e) => { e.stopPropagation(); createSession(wsInfo || null); };
+    h.append(addBtn);
     box.append(h);
     const shown = expanded ? g.list : g.list.slice(0, LIMIT);
     for (const it of shown) box.append(buildRow(it));
     if (g.list.length > LIMIT) {
       const more = el('button', 'ws-more');
-      const rest = g.list.length - LIMIT;
-      more.textContent = expanded ? '收起 ⌃' : ('展开剩余 ' + rest + ' 个 ⌄');
+      const restCount = g.list.length - LIMIT;
+      more.textContent = expanded ? '收起 ⌃' : ('展开剩余 ' + restCount + ' 个 ⌄');
       more.onclick = () => {
         if (expanded) state.expandedGroups.delete(key); else state.expandedGroups.add(key);
-        loadSessions().catch(() => {});
+        paintSessionList(items, fromCache);
       };
       box.append(more);
     }
   }
-  return;
+}
+
+// 轻量列表（服务器侧裁剪，87KB 而不是 1.95MB，iPhone 解析不卡）
+function mapLightItem(it) {
+  const p = it.project || {};
+  return {
+    sessionId: it.sessionId,
+    running: it.running === true,
+    updatedAt: it.updatedAt || 0,
+    cwd: it.cwd || '',
+    blank: it.blank === true,
+    projections: {
+      values: {
+        title: p.title || '',
+        sessionStats: {
+          turns: p.turns || 0, decodeMs: p.decodeMs || 0, decodeTokens: p.decodeTokens || 0,
+          llmMs: p.llmMs || 0, toolMs: p.toolMs || 0,
+        },
+        tokenUsage: { outputTokens: p.outputTokens || 0 },
+        contextPressure: { pressureTokens: p.pressureTokens || 0, contextWindow: p.contextWindow || 0 },
+        modelSelection: p.model ? { next: p.model, lastUsed: p.model } : null,
+        todos: p.todos || undefined,
+        goal: p.goal || undefined,
+      },
+    },
+  };
+}
+
+async function fetchSessionList() {
+  try {
+    const r = await fetch('/m/list', { cache: 'no-store' });
+    const j = await r.json();
+    if (j && j.ok && Array.isArray(j.items) && j.items.length) {
+      return { items: j.items.map(mapLightItem) };
+    }
+  } catch {}
+  return await rpc('session/list', { _request: {} });
+}
+
+async function loadSessions() {
+  const slowTimer = setTimeout(() => toast('服务器较慢，正在读取会话…', 3000), 8000);
+  let value;
+  try {
+    value = await fetchSessionList();
+  } finally {
+    clearTimeout(slowTimer);
+  }
+  const items = (value?.items || [])
+    .filter((it) => !state.archived.has(it.sessionId))
+    .filter((it) => it.blank !== true)
+    .slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  state.sessions = items;
+  state.sessionsLoaded = true;
+  saveSessionsCache(items);
+  paintSessionList(items, false);
 }
 
 function buildRow(it) {
-  {
-    const v = it.projections?.values || {};
-    const row = el('div', 'row');
-    const info = el('div', 'row-info');
-    const isPinned = state.pinned.has(it.sessionId);
-    const titleLine = el('div', 't');
-    if (isPinned) titleLine.append(el('span', 'pin', '📌'));
-    titleLine.append(document.createTextNode(v.title || (it.blank ? '（空白会话）' : it.sessionId.slice(8, 16))));
-    info.append(titleLine);
-    row.append(info);
-    if (it.running) row.append(el('span', 'badge run', '运行中'));
-    const more = el('button', 'row-more', '⋯');
-    more.onclick = (e) => { e.stopPropagation(); openRowMenu(it); };
-    row.append(more);
-    row.onclick = () => openSession(it);
-    return row;
-  }
+  const v = it.projections?.values || {};
+  const row = el('div', 'row');
+  const info = el('div', 'row-info');
+  const isPinned = state.pinned.has(it.sessionId);
+  const titleLine = el('div', 't');
+  if (isPinned) titleLine.append(el('span', 'pin', '📌'));
+  titleLine.append(document.createTextNode(v.title || (it.blank ? '（空白会话）' : it.sessionId.slice(8, 16))));
+  info.append(titleLine);
+  row.append(info);
+  if (it.running) row.append(el('span', 'badge run', '运行中'));
+  const more = el('button', 'row-more', '⋯');
+  more.onclick = (e) => { e.stopPropagation(); openRowMenu(it); };
+  row.append(more);
+  row.onclick = () => openSession(it);
+  return row;
 }
 
 /* ---------- 模型切换 ---------- */
@@ -265,19 +378,53 @@ async function openModelSheet() {
       left.append(el('div', 'msub', bits.join(' · ')));
       row.append(left);
       if (cur && cur.provider === g.id && cur.model === model.id) row.classList.add('cur');
-      row.onclick = () => selectModel(g.id, model).catch(() => {});
+      row.onclick = () => pickModel(g.id, model);
       list.append(row);
     }
   }
 }
 
-async function selectModel(provider, model) {
+function pickModel(provider, model) {
+  const efforts = model.reasoning?.efforts || [];
+  if (!efforts.length) { selectModel(provider, model, undefined).catch(() => {}); return; }
+  const list = $('#model-list');
+  list.replaceChildren();
+  const head = el('div', 'mgroup', '推理强度 · ' + (model.name || model.id));
+  head.style.display = 'flex';
+  head.style.alignItems = 'center';
+  head.style.gap = '8px';
+  const back = el('button', 'mback', '‹ 返回');
+  back.onclick = () => openModelSheet().catch(() => {});
+  head.prepend(back);
+  list.append(head);
+
+  const cur = state.model;
+  const curSame = cur && cur.provider === provider && cur.model === model.id;
+  const defaultRow = el('div', 'mrow');
+  defaultRow.append(el('div', 'mname', '不指定（用模型默认）'));
+  defaultRow.onclick = () => selectModel(provider, model, undefined).catch(() => {});
+  list.append(defaultRow);
+
+  for (const e of efforts) {
+    const row = el('div', 'mrow');
+    const left = el('div');
+    left.append(el('div', 'mname', e.name || e.id));
+    if (e.description) left.append(el('div', 'msub', e.description));
+    row.append(left);
+    if (curSame && cur.reasoningEffort === e.id) { row.classList.add('cur'); left.append(el('div', 'msub', '当前')); }
+    row.onclick = () => selectModel(provider, model, e.id).catch(() => {});
+    list.append(row);
+  }
+}
+
+async function selectModel(provider, model, explicitEffort) {
   if (!state.sessionId) return;
-  // 尽量沿用当前 reasoningEffort；模型不支持就用它自己的最大档
   const efforts = (model.reasoning?.efforts || []).map((x) => x.id);
-  let effort = state.model?.reasoningEffort;
-  if (!effort || (efforts.length && !efforts.includes(effort))) {
-    effort = efforts.includes('max') ? 'max' : (efforts[efforts.length - 1] || undefined);
+  let effort = explicitEffort;
+  if (effort === undefined) {
+    // 没显式指定时：沿用当前档位，不兼容就用最大档
+    effort = state.model?.reasoningEffort;
+    if (!effort || (efforts.length && !efforts.includes(effort))) effort = undefined;
   }
   const req = { sessionId: state.sessionId, provider, model: model.id };
   if (effort) req.reasoningEffort = effort;
@@ -290,17 +437,185 @@ async function selectModel(provider, model) {
   } catch (e) { toast('切换失败：' + e.message, 5000); }
 }
 
+/* ---------- 手机推送（Web Push） ---------- */
+function urlB64ToU8(base64) {
+  const pad = '='.repeat((4 - (base64.length % 4)) % 4);
+  const raw = atob((base64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+async function pushSubscription() {
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return null;
+    const reg = await navigator.serviceWorker.ready;
+    return await reg.pushManager.getSubscription();
+  } catch { return null; }
+}
+
+async function updateBell() {
+  const b = $('#bell');
+  if (!b) return;
+  const sub = await pushSubscription();
+  const on = !!sub && Notification.permission === 'granted';
+  b.textContent = on ? '🔔' : '🔕';
+  b.classList.toggle('on', on);
+  b.title = on ? '通知已开启（点击关闭）' : '点击开启通知';
+}
+
+async function togglePush() {
+  const b = $('#bell');
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      toast('此设备/浏览器不支持推送（需 iOS 16.4+ 且已添加到主屏幕）', 5000);
+      return;
+    }
+    const sub = await pushSubscription();
+    if (sub) {
+      await fetch('/push/unsubscribe', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ endpoint: sub.endpoint }),
+      }).catch(() => {});
+      await sub.unsubscribe().catch(() => {});
+      toast('通知已关闭', 2000);
+      updateBell();
+      return;
+    }
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { toast('你拒绝了通知权限，可在系统设置里重新打开', 4000); return; }
+    const info = await (await fetch('/push/vapid', { cache: 'no-store' })).json();
+    const reg = await navigator.serviceWorker.ready;
+    const newSub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlB64ToU8(info.publicKey),
+    });
+    const r = await fetch('/push/subscribe', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(newSub.toJSON()),
+    });
+    if (!r.ok) throw new Error('订阅保存失败 ' + r.status);
+    toast('通知已开启：回合结束 / 需要审批 / 需要回答都会提醒', 4000);
+    updateBell();
+  } catch (e) {
+    toast('开启失败：' + e.message, 5000);
+  }
+}
+
+/* ---------- 会话列表本地缓存（服务器慢时先显示旧列表） ---------- */
+const CACHE_SESSIONS = 'dsh.cache.sessions.v1';
+const CACHE_WS = 'dsh.cache.workspaces.v1';
+// 离线缓存：7 天过期、最多 300 条会话 / 50 个工作区（避免无限膨胀，也减少丢手机时的暴露面）
+const CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CACHE_MAX_SESSIONS = 300;
+const CACHE_MAX_WS = 50;
+
+function clearOfflineCache() {
+  try { localStorage.removeItem(CACHE_SESSIONS); } catch {}
+  try { localStorage.removeItem(CACHE_WS); } catch {}
+}
+
+function saveSessionsCache(items) {
+  try {
+    const slim = items.map((it) => ({
+      sessionId: it.sessionId,
+      running: it.running === true,
+      blank: it.blank === true,
+      cwd: it.cwd || '',
+      updatedAt: it.updatedAt || 0,
+      title: it.projections?.values?.title || '',
+      turns: it.projections?.values?.sessionStats?.turns || 0,
+    }));
+    localStorage.setItem(CACHE_SESSIONS, JSON.stringify({ at: Date.now(), items: slim.slice(0, CACHE_MAX_SESSIONS) }));
+  } catch {}
+}
+
+function readSessionsCache() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CACHE_SESSIONS) || 'null');
+    if (!raw || !Array.isArray(raw.items)) return null;
+    if (!raw.at || Date.now() - raw.at > CACHE_TTL_MS) { localStorage.removeItem(CACHE_SESSIONS); return null; }
+    const items = raw.items.map((x) => ({
+      sessionId: x.sessionId,
+      running: x.running,
+      blank: x.blank,
+      cwd: x.cwd,
+      updatedAt: x.updatedAt,
+      projections: { values: { title: x.title, sessionStats: { turns: x.turns } } },
+    }));
+    return { at: raw.at, items };
+  } catch { return null; }
+}
+
+function saveWorkspacesCache() {
+  try {
+    const list = state.workspaces.map((w) => ({
+      id: w.id, title: w.title, path: w.path,
+      sessionIds: Array.from(w.sessionIds || []),
+    }));
+    localStorage.setItem(CACHE_WS, JSON.stringify({ at: Date.now(), list: list.slice(0, CACHE_MAX_WS) }));
+  } catch {}
+}
+
+function readWorkspacesCache() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(CACHE_WS) || 'null');
+    if (raw && raw.at && Date.now() - raw.at > CACHE_TTL_MS) { localStorage.removeItem(CACHE_WS); return null; }
+    if (raw && Array.isArray(raw.list)) {
+      return raw.list.map((w) => ({
+        id: w.id, title: w.title, path: w.path,
+        sessionIds: new Set(Array.isArray(w.sessionIds) ? w.sessionIds : []),
+      }));
+    }
+  } catch {}
+  return null;
+}
+
+/** 先用缓存把列表画出来（避免空白/像连不上），再等真实数据替换 */
+function renderFromCache() {
+  const cached = readSessionsCache();
+  if (!cached) return false;
+  if (!state.workspaces.length) {
+    const ws = readWorkspacesCache();
+    if (ws) state.workspaces = ws;
+  }
+  const items = cached.items.filter((it) => !state.archived.has(it.sessionId) && it.blank !== true);
+  if (!items.length) return false;
+  paintSessionList(items, true);
+  return true;
+}
+
+/* ---------- 刷新列表（含版本检测） ---------- */
+async function refreshListWithVersion(ptrEl) {
+  try {
+    const r = await fetch('/m/build.txt?t=' + Date.now(), { cache: 'no-store' });
+    const remote = (await r.text()).trim();
+    if (remote && remote !== String(BUILD)) {
+      if (ptrEl) ptrEl.textContent = '发现新版本，正在更新…';
+      location.reload();
+      return;
+    }
+    await loadSessions();
+    return true;
+  } catch (e) {
+    toast('刷新失败：' + e.message, 4000);
+    return false;
+  }
+}
+
 /* ---------- 下拉刷新 ---------- */
-function bindPullToRefresh() {
-  const scroller = $('#sessions');
-  const ptr = $('#ptr');
+function bindPull(scrollerSel, ptrSel, onRefresh) {
+  const scroller = $(scrollerSel);
+  const ptr = $(ptrSel);
   if (!scroller || !ptr) return;
   let startY = null, armed = false, busy = false;
+
   scroller.addEventListener('touchstart', (e) => {
     if (busy) return;
     if (scroller.scrollTop <= 0) { startY = e.touches[0].clientY; armed = false; }
     else startY = null;
   }, { passive: true });
+
   scroller.addEventListener('touchmove', (e) => {
     if (startY === null || busy) return;
     if (scroller.scrollTop > 0) { startY = null; return; }
@@ -311,6 +626,7 @@ function bindPullToRefresh() {
     ptr.textContent = armed ? '松开刷新' : '下拉刷新';
     if (e.cancelable) e.preventDefault();
   }, { passive: false });
+
   const finish = async () => {
     if (startY === null) { ptr.classList.remove('on'); return; }
     const shouldRefresh = armed;
@@ -319,28 +635,54 @@ function bindPullToRefresh() {
     busy = true;
     ptr.textContent = '刷新中…';
     ptr.classList.add('loading');
-    try {
-      // 先看有没有新版本：有就整页重载，顺带把代码更新掉
-      const r = await fetch('/m/build.txt?t=' + Date.now(), { cache: 'no-store' });
-      const remote = (await r.text()).trim();
-      if (remote && remote !== String(BUILD)) {
-        ptr.textContent = '发现新版本，正在更新…';
-        location.reload();
-        return;
-      }
-      await loadSessions();
-    } catch (e) { toast('刷新失败：' + e.message, 4000); }
+    try { await onRefresh(ptr); } catch (e) { toast('刷新失败：' + e.message, 4000); }
     busy = false;
     ptr.classList.remove('loading');
     ptr.textContent = '已刷新';
     setTimeout(() => { ptr.classList.remove('on'); ptr.textContent = '下拉刷新'; }, 450);
   };
+
   scroller.addEventListener('touchend', finish, { passive: true });
   scroller.addEventListener('touchcancel', finish, { passive: true });
 }
 
+function bindPullToRefresh() {
+  // 列表页：查版本 + 刷数据
+  bindPull('#sessions', '#ptr', async (ptr) => { await refreshListWithVersion(ptr); });
+  // 对话页：重新拉当前会话
+  bindPull('#messages', '#ptr2', async () => {
+    if (!state.sessionId) return;
+    const it = state.sessions.find((s) => s.sessionId === state.sessionId);
+    if (it) await openSession(it);
+    else await openFollow(state.sessionId);
+    scrollBottom(true);
+  });
+}
+
 /* ---------- 会话详情 ---------- */
+async function createSession(ws) {
+  try {
+    const req = {};
+    if (ws?.id) req.workspaceId = ws.id;
+    else if (ws?.path) req.cwd = ws.path;
+    const v = await rpc('session/create', { request: req });
+    const sid = v?.sessionId;
+    if (!sid) throw new Error('未返回会话 id');
+    toast('已新建对话', 1500);
+    const item = {
+      sessionId: sid,
+      running: false,
+      projections: { values: { title: '新对话' } },
+      cwd: ws?.path || '',
+    };
+    await openSession(item);
+  } catch (e) {
+    toast('新建失败：' + e.message, 4000);
+  }
+}
+
 async function openSession(it) {
+  try { state.listScroll = $('#sessions') ? $('#sessions').scrollTop : 0; } catch {}
   state.sessionId = it.sessionId;
   const v = it.projections?.values || {};
   $('#title').textContent = v.title || it.sessionId.slice(8, 16);
@@ -381,6 +723,7 @@ function showView(name) {
   $('#view-chat').hidden = !chat;
   $('#view-list').hidden = chat;
   $('#back').hidden = !chat;
+  const nc = $('#newchat'); if (nc) nc.hidden = chat;
   if (!chat) { $('#title').textContent = 'DSH'; stopTicker(); }
 }
 
@@ -389,6 +732,15 @@ function closeSession() {
   showView('list');
   $('#title').textContent = 'DSH'; $('#pending').replaceChildren();
   state.view = 'list'; state.sessionId = null;
+  // 恢复之前的滚动位置（列表 DOM 本来就在，不需要重建）
+  requestAnimationFrame(() => {
+    const box = $('#sessions');
+    if (box && state.listScroll > 0) box.scrollTop = state.listScroll;
+  });
+  // 列表数据延迟刷新：先保证能立刻滑动，不被重绘卡住
+  setTimeout(() => {
+    if (state.view === 'list' && !state.touching) loadSessions().catch(() => {});
+  }, 600);
 }
 
 function openFollow(sessionId) {
@@ -397,7 +749,7 @@ function openFollow(sessionId) {
   ws.__buf = ''; state.followWs = ws;
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'open', streamId: 'follow', endpoint: 'session/follow',
-      payload: { args: { request: { address: { kind: 'session', sessionId }, assistantStream: true, maxMessages: 80 } } } }));
+      payload: { args: { request: { address: { kind: 'session', sessionId }, assistantStream: true, maxMessages: 24 } } } }));
   };
   ws.onmessage = (ev) => {
     let f; try { f = JSON.parse(ev.data); } catch { return; }
@@ -1383,8 +1735,28 @@ $('#back').onclick = () => {
 window.addEventListener('popstate', () => {
   if (state.view === 'chat') closeSession();
 });
-$('#refresh').onclick = () => { if (state.view === 'list') loadSessions().catch((e) => toast(e.message)); else if (state.sessionId) { const it = state.sessions.find((s) => s.sessionId === state.sessionId); if (it) openSession(it); } };
+$('#newchat').onclick = () => createSession(null);
+$('#bell').onclick = () => togglePush().catch(() => {});
+updateBell().catch(() => {});
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (ev) => {
+    const d = ev.data || {};
+    if (d.type === 'open-session' && d.sessionId) {
+      const it = state.sessions.find((x) => x.sessionId === d.sessionId);
+      if (it) openSession(it);
+    }
+  });
+}
 $('#stop').onclick = (e) => { e.preventDefault(); stopRun(); };
+$('#sessions').addEventListener('touchstart', () => { state.touching = true; }, { passive: true });
+$('#sessions').addEventListener('touchend', () => {
+  state.touching = false;
+  if (state.pendingListPaint) { const f = state.pendingListPaint; state.pendingListPaint = null; setTimeout(f, 30); }
+}, { passive: true });
+$('#sessions').addEventListener('touchcancel', () => {
+  state.touching = false;
+  if (state.pendingListPaint) { const f = state.pendingListPaint; state.pendingListPaint = null; setTimeout(f, 30); }
+}, { passive: true });
 $('#messages').addEventListener('scroll', updateJumpBtn, { passive: true });
 $('#jumpbtn').onclick = () => { scrollBottom(true); updateJumpBtn(); };
 $('#input').addEventListener('focus', () => { setTimeout(syncViewport, 120); setTimeout(syncViewport, 420); });
@@ -1428,6 +1800,12 @@ $('#pick-file').onclick = (e) => {
 };
 document.addEventListener('click', closeAttachMenu);
 let verTaps = 0, verTapTimer = null;
+let verHoldTimer = null;
+$('#ver').addEventListener('pointerdown', () => {
+  clearTimeout(verHoldTimer);
+  verHoldTimer = setTimeout(() => { clearOfflineCache(); toast('已清除本地离线缓存', 2000); }, 900);
+});
+['pointerup', 'pointercancel', 'pointerleave'].forEach((ev) => $('#ver').addEventListener(ev, () => clearTimeout(verHoldTimer)));
 $('#ver').addEventListener('click', () => {
   verTaps += 1;
   clearTimeout(verTapTimer);
@@ -1565,16 +1943,35 @@ showVersion();
 
 (async function boot() {
   $('#messages').replaceChildren();
-  $('#gate-btn').onclick = () => { hideGate(); login().catch(() => {}); };
+  $('#gate-btn').onclick = () => {
+    const inp = $('#gate-pass');
+    const pw = inp && inp.value ? inp.value.trim() : '';
+    if (pw) { passwordLogin(pw).catch(() => {}); return; }
+    hideGate();
+    login().catch(() => {});
+  };
+  const offBtn = $('#gate-offline');
+  if (offBtn) offBtn.onclick = () => {
+    if (renderFromCache()) { hideGate(); toast('已进入离线缓存视图', 2500); }
+    else toast('还没有缓存数据', 2500);
+  };
+  const passEl = $('#gate-pass');
+  if (passEl) passEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#gate-btn').click(); } });
   await ensureAuthCookie();
   // 等归档集合到位再拉列表，避免先闪出已归档会话
   const archivedGate = new Promise((resolve) => { state.archivedReady = resolve; });
   openWorkspaceStream();
   await Promise.race([archivedGate, new Promise((r) => setTimeout(r, 1500))]);
+  // 先用本地缓存把列表画出来（服务器慢时也不至于白屏）
+  let cachedShown = false;
+  try { cachedShown = renderFromCache(); hideGate(); } catch (e) { reportErr('renderFromCache failed', e); }
   try {
     await loadSessions();
     hideGate();
   } catch (e) {
+    reportErr('boot load failed', e);
+    if (cachedShown) { toast('刷新失败（正在显示缓存列表）：' + e.message, 4000); return; }
+    reportErr('boot gate: ' + e.message, e);
     if (/未登录/.test(e.message)) { showGate('需要登录后才能查看会话'); return; }
     showGate('加载失败：' + e.message + '\n点下面按钮重试');
     return;

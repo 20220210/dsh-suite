@@ -93,10 +93,10 @@ body{position:fixed;inset:0;overflow:hidden}
 .badge.pend{background:rgba(229,72,77,.18);color:#ff8b8f}
 
 /* 下拉刷新 */
-#ptr{flex:none;height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;
+#ptr,#ptr2{flex:none;height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;
   color:var(--dim);font-size:13px;transition:height .12s ease}
-#ptr.on{height:46px}
-#ptr.loading{color:#9db0ff}
+#ptr.on,#ptr2.on{height:46px}
+#ptr.loading,#ptr2.loading{color:#9db0ff}
 
 /* 顶栏版本号 */
 #ver{color:var(--dim);font-size:11px;font-family:ui-monospace,Menlo,monospace;padding:0 4px;flex:none}
@@ -357,3 +357,24 @@ details.think .think-body{white-space:pre-wrap;margin-top:6px;max-height:40vh;ov
   background:rgba(27,37,50,.94);color:var(--fg);font-size:20px;line-height:34px;padding:0;
   box-shadow:0 4px 16px rgba(0,0,0,.5);backdrop-filter:blur(8px)}
 #jumpbtn[hidden]{display:none}
+
+/* 工作区标题右侧的新建按钮 */
+.ws-add{margin-left:auto;flex:none;background:rgba(80,120,255,.14);
+  border:1px solid rgba(80,120,255,.4);color:#c7d4ff;font-size:14px;
+  width:28px;height:24px;border-radius:8px;line-height:22px;padding:0}
+.ws-add:active{background:rgba(80,120,255,.28)}
+
+/* 推理强度选择 */
+.mback{background:none;border:0;color:var(--brand);font-size:13px;padding:0 6px 0 0}
+
+/* 通知铃铛 */
+#bell.on{color:#ffd479;text-shadow:0 0 8px rgba(255,212,121,.5)}
+
+/* 缓存列表提示 */
+.cached-hint{font-size:11px;color:var(--dim);padding:6px 12px 2px;opacity:.8}
+
+/* 登录密码框 */
+#gate-pass{width:100%;box-sizing:border-box;margin:10px 0 12px;padding:11px 12px;
+  border-radius:10px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);font-size:15px}
+
+#gate-offline{background:none;border:1px solid var(--line);color:var(--dim);margin-top:8px}
