@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '146';   // 部署时由脚本替换成时间戳
+const BUILD = '147';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -303,6 +303,7 @@ function mapLightItem(it) {
         modelSelection: p.model ? { next: p.model, lastUsed: p.model } : null,
         todos: p.todos || undefined,
         goal: p.goal || undefined,
+        inbox: p.inbox || undefined,
       },
     },
   };
@@ -735,6 +736,13 @@ async function openSession(it) {
   clearLiveBubbles(); setRunning(false); clearThinkLine();
   const tk = $('#tasks'); if (tk) { tk.replaceChildren(); tk.hidden = true; }
   state.shownRpc = new Set();
+  // 恢复服务端排队消息：连续发多条时，只有第一条已落成消息，其余还在 inbox（next-turn/next-step）
+  state.queue = [];
+  const inbox = v.inbox || {};
+  for (const q of [...(inbox.nextTurn || []), ...(inbox.nextStep || [])]) {
+    if (q && q.text) state.queue.push({ itemId: q.id, requestId: q.rpcId || null, text: q.text });
+  }
+  if (typeof renderQueue === 'function') renderQueue();
   state.model = v.modelSelection?.next || v.modelSelection?.lastUsed || null;
   state.stats = null;
   if (v.sessionStats) {

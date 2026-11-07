@@ -609,6 +609,19 @@ const RC2_BRIDGE = process.env.DSH_RC2_BRIDGE || 'http://127.0.0.1:19393';
 let rc2Cache = { at: 0, items: [] };
 let rc2Cookie = { at: 0, value: '' };
 
+function slimInbox(inbox) {
+  if (!inbox || typeof inbox !== 'object') return null;
+  const pick = (arr) => (Array.isArray(arr) ? arr : []).map((x) => ({
+    id: x && x.id,
+    rpcId: (x && x.source && x.source.rpcId) || null,
+    text: ((x && x.content) || []).filter((p) => p && p.type === 'text').map((p) => p.text).join(''),
+  })).filter((x) => x.text);
+  const nextTurn = pick(inbox['next-turn']);
+  const nextStep = pick(inbox['next-step']);
+  if (!nextTurn.length && !nextStep.length) return null;
+  return { nextTurn, nextStep };
+}
+
 function slimItems(items) {
   return (Array.isArray(items) ? items : []).map((it) => {
     const v = it.projections?.values || {};
@@ -633,6 +646,7 @@ function slimItems(items) {
         todos: v.todos || null,
         goal: v.goal?.goal || v.goal || null,
         agentId: it.agentId || null,
+        inbox: slimInbox(v.inbox),
       },
     };
   });
@@ -723,6 +737,7 @@ const server = http.createServer(async (req, res) => {
             todos: v.todos || null,
             goal: v.goal?.goal || v.goal || null,
             agentId: it.agentId || null,
+            inbox: slimInbox(v.inbox),
           },
         };
       });
