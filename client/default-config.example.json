@@ -22,5 +22,17 @@
     "enabled": true,
     "onlyWhenUnfocused": true,
     "minSeconds": 20
-  }
+  },
+  "instances": [
+    {
+      "name": "主实例",
+      "upstream": "https://tnty.9017i.cc:19306",
+      "port": 19390
+    },
+    {
+      "name": "rc.2 实例",
+      "upstream": "https://tnty.9017i.cc:19306/rc2",
+      "port": 19392
+    }
+  ]
 }

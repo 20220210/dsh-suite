@@ -12,7 +12,30 @@ const { createUpdater } = require('./updater.cjs');
 const { applyPendingUpdate } = require('./apply-update.cjs');
 
 const PROXY_PORT = 19390;
-const PROXY_URL = `http://127.0.0.1:${PROXY_PORT}/`;
+
+// 多实例：默认两个（主实例 / rc.2 实例），可在 config.json 的 instances 里增删改
+const DEFAULT_INSTANCES = [
+  { name: '主实例', upstream: 'https://tnty.9017i.cc:19306', port: 19390 },
+  { name: 'rc.2 实例', upstream: 'https://tnty.9017i.cc:19306/rc2', port: 19392 },
+];
+let instances = DEFAULT_INSTANCES.map((x) => ({ ...x }));
+let currentInst = 0;
+function inst(i = currentInst) { return instances[i] || instances[0] || { name: '主实例', upstream: '', port: PROXY_PORT }; }
+function instUrl(i = currentInst) { return `http://127.0.0.1:${inst(i).port}/`; }
+
+/** 从 config.json 读实例列表：第 1 个用顶层 upstream，其余用 instances[].upstream。 */
+function loadInstances() {
+  const cfg = readConfig() || {};
+  const base = String(cfg.upstream || 'https://tnty.9017i.cc:19306');
+  const raw = Array.isArray(cfg.instances) && cfg.instances.length ? cfg.instances : DEFAULT_INSTANCES;
+  const list = raw.map((x, i) => ({
+    name: String((x && x.name) || (i === 0 ? '主实例' : `实例 ${i + 1}`)),
+    upstream: i === 0 ? base : String((x && x.upstream) || ''),
+    port: Number((x && x.port) || (i === 0 ? PROXY_PORT : PROXY_PORT + i * 2)),
+  })).filter((x) => x.upstream && Number.isFinite(x.port));
+  instances = list.length ? list : [{ name: '主实例', upstream: base, port: PROXY_PORT }];
+  if (currentInst >= instances.length) currentInst = 0;
+}
 
 // 调试用：设置 DSH_DEBUG_CDP=1 时开放 Chrome DevTools 协议端口（排查界面问题用，默认关闭）
 if (process.env.DSH_DEBUG_CDP === '1') {
@@ -20,7 +43,16 @@ if (process.env.DSH_DEBUG_CDP === '1') {
 }
 
 let mainWindow = null;
-let proxyChild = null;
+const proxyChildren = new Map();   // port -> child
+
+// 客户端机器标识（远端据此区分哪台电脑/哪个实例）
+const CLIENT_NAME = (() => {
+  try {
+    const cfg = (() => { try { return JSON.parse(fs.readFileSync(path.join(process.env.APPDATA || '', 'DSH Desktop', 'config.json'), 'utf8').replace(/^\uFEFF/, '')); } catch { return {}; } })();
+    if (cfg && typeof cfg.clientName === 'string' && cfg.clientName.trim()) return cfg.clientName.trim();
+  } catch {}
+  try { return require('node:os').hostname() || 'dsh-client'; } catch { return 'dsh-client'; }
+})();
 let CONFIG_PATH = null;
 let remoteUntil = 0;
 let remoteTick = null;
@@ -403,15 +435,22 @@ function portOpen(port, timeoutMs = 1500) {
   });
 }
 
-function startProxy(cfgPath) {
+function startProxy(cfgPath, idx = 0) {
   const proxyScript = path.join(__dirname, 'proxy.mjs');
   const out = fs.createWriteStream(logFile(), { flags: 'a' });
   const runtime = runtimeConfig();
+  const it = inst(idx);
   const secrets = { basicUser: runtime.basicUser ?? '', basicPass: runtime.basicPass ?? '', token: runtime.token ?? '' };
   const key = cookieKey();
-  const extraEnv = { DSH_CLIENT_CONFIG: cfgPath, DSH_CLIENT_SECRETS: JSON.stringify(secrets) };
+  const extraEnv = {
+    DSH_CLIENT_CONFIG: cfgPath,
+    DSH_CLIENT_SECRETS: JSON.stringify(secrets),
+    DSH_CLIENT_UPSTREAM: it.upstream,
+    DSH_CLIENT_PORT: String(it.port),
+    DSH_CLIENT_NAME: `${String(CLIENT_NAME || 'dsh-client').replace(/[^\x20-\x7E]/g, '')}-i${idx}`.replace(/\s+/g, '-'),
+  };
   if (key) extraEnv.DSH_CLIENT_KEY = key;
-  proxyChild = spawn(process.execPath, [proxyScript, '--no-open'], {
+  const child = spawn(process.execPath, [proxyScript, '--no-open'], {
     env: {
       ...process.env,
       ELECTRON_RUN_AS_NODE: '1', // 用 Electron 内置 Node 跑 ESM 脚本，用户无需装 Node
@@ -420,30 +459,32 @@ function startProxy(cfgPath) {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  proxyChildren.set(it.port, child);
   // end:false —— 不要把日志流结束掉，否则子进程退出后再写会抛 ERR_STREAM_WRITE_AFTER_END
-  proxyChild.stdout.pipe(out, { end: false });
-  proxyChild.stderr.pipe(out, { end: false });
+  child.stdout.pipe(out, { end: false });
+  child.stderr.pipe(out, { end: false });
   const logLine = (text) => { try { if (!out.writableEnded) out.write(text); } catch {} };
-  proxyChild.on('exit', (code) => {
-    logLine(`\n[main] 代理退出 code=${code}\n`);
+  child.on('exit', (code) => {
+    logLine(`\n[main] 代理退出 code=${code} (${it.name} :${it.port})\n`);
   });
-  proxyChild.on('error', (error) => {
-    logLine(`\n[main] 代理启动失败: ${error}\n`);
+  child.on('error', (error) => {
+    logLine(`\n[main] 代理启动失败 (${it.name}): ${error}\n`);
   });
-  proxyChild.on('close', () => { try { out.end(); } catch {} });
+  child.on('close', () => { proxyChildren.delete(it.port); try { out.end(); } catch {} });
 }
 
-function stopProxy() {
-  if (proxyChild && !proxyChild.killed) {
+function stopProxy(idx = currentInst) {
+  const child = proxyChildren.get(inst(idx).port);
+  if (child && !child.killed) {
     try {
-      proxyChild.kill();
+      child.kill();
     } catch {}
   }
 }
 
-function proxyInfo() {
+function proxyInfo(idx = currentInst) {
   return new Promise((resolve) => {
-    const req = http.get(`${PROXY_URL}__proxy/stats`, { timeout: 1500 }, (res) => {
+    const req = http.get(`${instUrl(idx)}__proxy/stats`, { timeout: 1500 }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => (body += chunk));
@@ -471,9 +512,9 @@ function killStaleProxy(pid) {
   } catch {}
 }
 
-function proxyAlive() {
+function proxyAlive(idx = currentInst) {
   return new Promise((resolve) => {
-    const req = http.get(PROXY_URL, { timeout: 1500 }, (res) => {
+    const req = http.get(instUrl(idx), { timeout: 1500 }, (res) => {
       res.resume();
       resolve(true);
     });
@@ -485,10 +526,10 @@ function proxyAlive() {
   });
 }
 
-async function waitProxy(timeoutMs = 60000) {
+async function waitProxy(timeoutMs = 60000, idx = currentInst) {
   const started = Date.now();
   for (;;) {
-    if (await proxyAlive()) return true;
+    if (await proxyAlive(idx)) return true;
     if (Date.now() - started > timeoutMs) return false;
     await new Promise((r) => setTimeout(r, 400));
   }
@@ -591,7 +632,7 @@ function notifyTaskDone(title, durationMs) {
 
 function fetchWatch() {
   return new Promise((resolve) => {
-    const req = http.get(`${PROXY_URL}__proxy/watch`, { timeout: 4000 }, (res) => {
+    const req = http.get(`${instUrl()}__proxy/watch`, { timeout: 4000 }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => (body += chunk));
@@ -706,7 +747,7 @@ function checkAuthState(stats) {
         startProxy(CONFIG_PATH || ensureConfig());
         const ok = await waitProxy(30000);
         authWarned = false;
-        if (ok && mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(PROXY_URL);
+        if (ok && mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(instUrl());
         mainLog('已用新密码重启本地代理');
       } catch (error) {
         mainLog('用新密码重启代理失败: ' + String(error && error.message ? error.message : error));
@@ -768,13 +809,13 @@ function createWindow() {
     },
   });
 
-  mainWindow.loadURL(PROXY_URL);
+  mainWindow.loadURL(instUrl());
   // 首页偶尔会因本地代理刚起步/上游忙而加载失败（窗口就一片黑），这里自动重试几次
   mainWindow.webContents.on('did-fail-load', (_e, errorCode, errorDesc, validatedURL) => {
     try { mainLog(`页面加载失败 ${errorCode} ${errorDesc} ${validatedURL}，1.5 秒后重试`); } catch {}
     if (errorCode === -3) return; // 主动 abort（例如重载）不算失败
     setTimeout(() => {
-      try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(PROXY_URL); } catch {}
+      try { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.loadURL(instUrl()); } catch {}
     }, 1500);
   });
   mainWindow.on('closed', () => {
@@ -820,7 +861,7 @@ function createWindow() {
 
 function fetchProxyStats() {
   return new Promise((resolve, reject) => {
-    const req = http.get(`${PROXY_URL}__proxy/stats`, { timeout: 4000 }, (res) => {
+    const req = http.get(`${instUrl()}__proxy/stats`, { timeout: 4000 }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c) => (body += c));
@@ -893,16 +934,16 @@ async function hardReconnect() {
       await new Promise((r) => setTimeout(r, 700));
     }
   } catch {}
-  killPortOwner(19390);
+  killPortOwner(inst().port);
   await new Promise((r) => setTimeout(r, 300));
-  startProxy(CONFIG_PATH || ensureConfig());
-  const ok = await waitProxy(35000);
+  startProxy(CONFIG_PATH || ensureConfig(), currentInst);
+  const ok = await waitProxy(35000, currentInst);
   if (!ok) {
     dialog.showErrorBox('重连失败', '本地代理没有启动起来，请查看日志：\n' + logFile());
     return;
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
-    try { mainWindow.loadURL(PROXY_URL); } catch {}
+    try { mainWindow.loadURL(instUrl()); } catch {}
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
     mainWindow.focus();
@@ -966,7 +1007,7 @@ function restartAsAdmin() {
 function proxyRequest(method, path, payload) {
   return new Promise((resolve) => {
     try {
-      const url = new URL(PROXY_URL + path.replace(/^\//, ''));
+      const url = new URL(instUrl() + path.replace(/^\//, ''));
       const body = payload ? JSON.stringify(payload) : null;
       const req = http.request(
         { hostname: url.hostname, port: url.port, path: url.pathname, method, timeout: 3000,
@@ -1046,6 +1087,42 @@ function ensureRemoteTicker() {
   remoteTick.unref?.();
 }
 
+/** 「实例」菜单项：每个实例一个单选项，点击切换窗口指向的本地代理 */
+function buildInstanceMenuItems() {
+  return instances.map((x, i) => ({
+    label: `${x.name}（${x.upstream.replace(/^https?:\/\//, '')}）`,
+    type: 'radio',
+    checked: i === currentInst,
+    accelerator: i < 9 ? `CmdOrCtrl+${i + 1}` : undefined,
+    click: () => { switchInstance(i).catch(() => {}); },
+  }));
+}
+
+/** 切换实例：必要时先拉起该实例的本地代理，再让窗口加载它 */
+async function switchInstance(i) {
+  if (i < 0 || i >= instances.length) return;
+  currentInst = i;
+  const it = inst(i);
+  mainLog(`切换实例：${it.name} ${it.upstream} (本机 :${it.port})`);
+  let alive = false;
+  try { alive = await proxyAlive(i); } catch {}
+  if (!alive) {
+    killPortOwner(it.port);
+    await new Promise((r) => setTimeout(r, 300));
+    startProxy(CONFIG_PATH || ensureConfig(), i);
+    const ok = await waitProxy(40000, i);
+    if (!ok) {
+      dialog.showErrorBox('切换实例失败', `「${it.name}」的本地代理没起来，请查看日志：\n` + logFile());
+      return;
+    }
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.loadURL(instUrl(i)); } catch {}
+    mainWindow.show();
+  }
+  buildMenu();
+}
+
 function buildMenu() {
   const template = [
     {
@@ -1079,6 +1156,10 @@ function buildMenu() {
         { type: 'separator' },
         { label: '开发者工具', role: 'toggleDevTools' },
       ],
+    },
+    {
+      label: '实例',
+      submenu: buildInstanceMenuItems(),
     },
     {
       label: '重连',
@@ -1128,7 +1209,7 @@ function buildMenu() {
               detail: [
                 `版本：${app.getVersion()}`,
                 `安装目录：${installDir()}`,
-                `本地代理：${PROXY_URL}`,
+                '实例：\n' + instances.map((x, i) => `  ${i === currentInst ? '▶' : ' '} ${x.name}  ${x.upstream}  (本机代理 :${x.port})`).join('\n'),
                 '缓存目录：' + path.join(process.env.LOCALAPPDATA || userDataDir(), 'dsh-client', 'cache'),
                 '日志：' + logFile(),
                 '',
@@ -1198,6 +1279,7 @@ if (!gotLock) {
     }
     const cfgPath = ensureConfig();
     CONFIG_PATH = cfgPath;
+    loadInstances();   // 多实例：主实例 + rc.2（可在 config.json 的 instances 改）
     // 1.3.4 起安装包不再内置密码：首次运行或密码缺失时弹窗输入
     {
       const rc = runtimeConfig();
@@ -1254,6 +1336,21 @@ if (!gotLock) {
     }
     createWindow();
     startNotifyWatcher();
+    // 其余实例的本地代理：后台启动，失败不影响主实例
+    for (let i = 1; i < instances.length; i++) {
+      (async () => {
+        const it = inst(i);
+        try {
+          if (await proxyAlive(i)) { mainLog(`实例「${it.name}」代理已在监听 :${it.port}`); return; }
+          killPortOwner(it.port);
+          startProxy(CONFIG_PATH || ensureConfig(), i);
+          const okExtra = await waitProxy(45000, i);
+          mainLog(`实例「${it.name}」代理${okExtra ? '已就绪' : '启动失败'} :${it.port}`);
+        } catch (e) {
+          mainLog(`实例「${it.name}」启动异常 ${String(e && e.message)}`);
+        }
+      })();
+    }
     // 凭据失效时提示一次
     setInterval(() => {
       proxyInfo().then((stats) => checkAuthState(stats)).catch(() => {});

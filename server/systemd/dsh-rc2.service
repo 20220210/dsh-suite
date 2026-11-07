@@ -1,0 +1,18 @@
+[Unit]
+Description=DeepSeek Harness rc.2 常驻实例（127.0.0.1:3081，独立数据 /root/.dsh-rc2）
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/dsh-rc2-host
+Environment=DSH_HOME=/root/.dsh-rc2
+Environment=DSH_BASE=/root/dsh-rc2-host/node_modules/@deepseek-ai
+ExecStart=/root/.nvm/versions/node/v22.23.2/bin/node node_modules/.bin/dsh --profile web --host 127.0.0.1 --port 3081 --no-open --trusted-host 127.0.0.1:3081 --trusted-host localhost:3081 --trusted-host 10.0.1.210:3081
+StandardOutput=append:/root/dsh-web-rc2.log
+StandardError=append:/root/dsh-web-rc2.log
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

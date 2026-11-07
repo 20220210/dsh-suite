@@ -27,12 +27,14 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.4.9';
+const VERSION = '1.5.0';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
 // 客户端机器标识：远端据此区分不同电脑（同名可改 config.json 的 "clientName"）
 function clientName() {
+  const envName = String(process.env.DSH_CLIENT_NAME || '').trim();
+  if (envName) return envName;
   try {
     const cfgPath = path.join(process.env.APPDATA || '', 'DSH Desktop', 'config.json');
     if (fs.existsSync(cfgPath)) {
@@ -42,7 +44,11 @@ function clientName() {
   } catch {}
   try { return os.hostname() || 'unknown'; } catch { return 'unknown'; }
 }
-const CLIENT_ID = clientName();
+// HTTP 头只能是 ASCII：安装目录/实例名里的中文会把请求头写崩（Invalid character in header content）
+const CLIENT_ID = (() => {
+  const raw = String(clientName() || '').replace(/[^\x20-\x7E]/g, '').replace(/\s+/g, '-').trim();
+  return raw.slice(0, 64) || 'dsh-client';
+})();
 
 // ---------------------------------------------------------------- 配置
 
@@ -69,17 +75,21 @@ function loadConfig() {
     console.error('[dsh-client] 请把 config.json 放在 exe 同目录，内容见 README。');
     process.exit(1);
   }
+  const port = Number(process.env.DSH_CLIENT_PORT || cfg.port || 19390);
+  const baseCache = cfg.cacheDir
+    ? path.resolve(dir, cfg.cacheDir)
+    : process.platform === 'win32'
+      ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'dsh-client', 'cache')
+      : path.join(os.homedir(), '.dsh-client', 'cache');
   const out = {
-    upstream: cfg.upstream ?? 'https://tnty.9017i.cc:19306',
+    // 多实例：桌面壳给每个实例传不同的 upstream/port（主实例 19390，rc.2 实例 19392）
+    upstream: process.env.DSH_CLIENT_UPSTREAM || cfg.upstream || 'https://tnty.9017i.cc:19306',
     basicUser: cfg.basicUser ?? '',
     basicPass: cfg.basicPass ?? '',
     token: cfg.token ?? '',
-    port: Number(cfg.port ?? 19390),
-    cacheDir: cfg.cacheDir
-      ? path.resolve(dir, cfg.cacheDir)
-      : process.platform === 'win32'
-        ? path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'dsh-client', 'cache')
-        : path.join(os.homedir(), '.dsh-client', 'cache'),
+    port,
+    // 每个实例独立缓存目录，避免两个代理抢同一个 session-list.json
+    cacheDir: process.env.DSH_CLIENT_CACHE_DIR || (port === 19390 ? baseCache : `${baseCache}-${port}`),
     openBrowser: cfg.openBrowser !== false,
     prefetch: cfg.prefetch !== false,
     prefetchConcurrency: Number(cfg.prefetchConcurrency ?? 4),
@@ -92,6 +102,15 @@ const cfg = loadConfig();
 const UP = new URL(cfg.upstream);
 const UP_HOST = UP.host; // 含端口，如 tnty.9017i.cc:19306
 const UP_ORIGIN = UP.origin; // https://tnty.9017i.cc:19306
+// upstream 可以带路径前缀（如 https://host:19306/rc2）：本代理会把所有请求加上该前缀，
+// 这样 rc.2 实例能复用已开放的 19306 端口，不用在路由器上再放一个端口。
+const UP_PATH_PREFIX = (UP.pathname || '/').replace(/\/+$/, '');
+function withUpPrefix(p) {
+  if (!UP_PATH_PREFIX) return p;
+  const path = p.startsWith('/') ? p : '/' + p;
+  if (path === UP_PATH_PREFIX || path.startsWith(UP_PATH_PREFIX + '/')) return path;
+  return UP_PATH_PREFIX + path;
+}
 const UP_HOSTNAME = UP.hostname;
 const UP_PORT = UP.port ? Number(UP.port) : 443;
 // 桌面壳用 Windows DPAPI 加密保存凭据，启动时解密后通过环境变量注入；直接运行代理时退回 config 明文
@@ -280,7 +299,7 @@ function rawRequest({ method = 'GET', path: reqPath, headers = {}, body = null, 
         port: UP_PORT,
         servername: UP_HOSTNAME,
         method,
-        path: reqPath,
+        path: withUpPrefix(reqPath),
         headers,
         agent,
         timeout: timeoutMs,
@@ -854,7 +873,7 @@ async function prefetchRecentSnapshots() {
     if (targets.length === 0) return;
     const t0 = Date.now();
     const outcome = await prefetchFollowSnapshots({
-      upstreamUrl: `wss://${UP_HOST}/api/remote.mux`,
+      upstreamUrl: `wss://${UP_HOST}${UP_PATH_PREFIX}/api/remote.mux`,
       headers: muxHeaders,
   getAsOfSeq: fetchAsOfSeq,
       cacheDir: CACHE_DIR,
@@ -1293,7 +1312,7 @@ function muxHeaders() {
 
 attachMux({
   server,
-  upstreamUrl: `wss://${UP_HOST}/api/remote.mux`,
+  upstreamUrl: `wss://${UP_HOST}${UP_PATH_PREFIX}/api/remote.mux`,
   headers: muxHeaders,
   cacheDir: CACHE_DIR,
   getAsOfSeq: fetchAsOfSeq,   // 回放缓存前先核对序号，避免"回放后无法衔接"导致断线

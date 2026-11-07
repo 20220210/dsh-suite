@@ -1,0 +1,12 @@
+[Unit]
+Description=DSH rc.2 token bridge（只为桌面客户端自动换 token，loopback:19393）
+After=network.target dsh-rc2.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/dsh-rc2-token-bridge.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

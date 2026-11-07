@@ -1,0 +1,60 @@
+# DSH rc.2 实例（127.0.0.1:3081，数据 /root/.dsh-rc2）的公网 + 局域网入口
+# 与 19306（主实例）同证书、同 BasicAuth，客户端把它当成"第二个实例"
+server {
+    listen 19307 ssl http2;
+    listen [::]:19307 ssl http2;
+    server_name tnty.9017i.cc;
+
+    ssl_certificate     /etc/nginx/ssl/tnty.9017i.cc.crt;
+    ssl_certificate_key /etc/nginx/ssl/tnty.9017i.cc.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:DSHRC2SSL:2m;
+
+    client_max_body_size 500m;
+
+    auth_basic "DSH RC2";
+    auth_basic_user_file /etc/nginx/dsh-gui.htpasswd;
+
+    # 桌面客户端自动换 token（走本机 bridge，BasicAuth 保护）
+    location = /_dsh/token {
+        proxy_pass http://127.0.0.1:19393/token;
+        proxy_set_header Host 127.0.0.1:19393;
+        add_header Cache-Control "no-store";
+    }
+
+    # WebSocket（会话流）
+    location = /api/remote.mux {
+        proxy_pass http://127.0.0.1:3081;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host 127.0.0.1:3081;
+        proxy_set_header Origin http://127.0.0.1:3081;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_buffering off;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3081;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # rc.2 只信任 loopback/10.0.1.210：把 Host/Origin 改写成它认识的本地源
+        proxy_set_header Host 127.0.0.1:3081;
+        proxy_set_header Origin http://127.0.0.1:3081;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+        proxy_socket_keepalive on;
+    }
+}
