@@ -628,7 +628,7 @@ function slimItems(items) {
     const ss = v.sessionStats || {};
     return {
       sessionId: it.sessionId,
-      running: it.running === true,
+      running: it.running === true && Date.now() - (it.updatedAt || 0) < 20 * 60 * 1000,
       updatedAt: it.updatedAt || 0,
       cwd: it.cwd || '',
       blank: it.blank === true,
@@ -719,7 +719,7 @@ const server = http.createServer(async (req, res) => {
         const ss = v.sessionStats || {};
         return {
           sessionId: it.sessionId,
-          running: it.running === true,
+          running: it.running === true && Date.now() - (it.updatedAt || 0) < 20 * 60 * 1000,
           updatedAt: it.updatedAt || 0,
           cwd: it.cwd || '',
           blank: it.blank === true,

@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '147';   // 部署时由脚本替换成时间戳
+const BUILD = '148';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -1998,6 +1998,20 @@ window.addEventListener('online', () => {
   }
 });
 window.addEventListener('offline', () => { state.connState = 'offline'; renderStats(); });
+
+// 列表页静默刷新：每 30 秒拉一次（/m/list 很轻），保证「运行中」标记不会一直停在旧状态
+setInterval(() => {
+  try {
+    if (state.view !== 'list') return;
+    if (document.visibilityState && document.visibilityState !== 'visible') return;
+    loadSessions().catch(() => {});
+  } catch {}
+}, 30000);
+document.addEventListener('visibilitychange', () => {
+  try {
+    if (document.visibilityState === 'visible' && state.view === 'list') loadSessions().catch(() => {});
+  } catch {}
+});
 $('#goalbar').onclick = () => openGoalSheet();
 $('#goal-close').onclick = () => { $('#goalsheet').hidden = true; };
 $('#goalsheet').querySelector('.sheet-mask').onclick = () => { $('#goalsheet').hidden = true; };
