@@ -248,6 +248,32 @@ export function attachMux(options) {
         return;
       }
 
+      if (frame.type === 'open' && frame.endpoint === '$events') {
+        // 窗口重连/断线期间可能丢了 turn/end 事件，导致列表里的「运行中」一直转圈。
+        // 这里用本地刚同步过的 session/list 主动下发一遍状态（只覆盖最近 30 分钟活跃的会话，避免刷屏）。
+        const streamId = frame.streamId;
+        setTimeout(() => {
+          try {
+            if (ws.readyState !== WebSocket.OPEN) return;
+            const items = typeof options.getListItems === 'function' ? options.getListItems() : null;
+            if (!items || !items.size) return;
+            const now = Date.now();
+            let sent = 0;
+            for (const it of items.values()) {
+              const sid = it && it.sessionId;
+              if (!sid) continue;
+              const running = it.running === true;
+              const fresh = now - (it.updatedAt || 0) < 30 * 60 * 1000;
+              if (!running && !fresh) continue;
+              try {
+                ws.send(JSON.stringify({ type: 'item', streamId, value: { type: 'emit', event: 'api-session/status', args: [sid, running] } }));
+                sent += 1;
+              } catch {}
+            }
+            if (sent) log?.('mux 已下发状态对齐 frame', sent + ' 条');
+          } catch {}
+        }, 1500);
+      }
       if (frame.type === 'open' && frame.endpoint === FOLLOW_ENDPOINT && frame.payload) {
         // 首屏只取最近 N 条（约 10 轮）：DSH 要解析整份日志，少取能显著加快切会话
         try {
