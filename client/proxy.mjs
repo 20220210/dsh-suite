@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.5.2';
+const VERSION = '1.5.3';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
@@ -332,7 +332,27 @@ function ensureLogin() {
 }
 
 /** 带自动重登的上游请求：cookie 过期（30 天）时用 token 重新登录并重试一次。 */
+/** 网络抖动时对上游请求做 2 次退避重试（公网客户端经常整体 TLS 连接被重置） */
 async function requestUpstream(options) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await requestUpstreamOnce(options);
+    } catch (e) {
+      lastErr = e;
+      const text = String((e && e.code) || '') + ' ' + String((e && e.message) || '');
+      const retriable = /ECONNRESET|ETIMEDOUT|EPIPE|ECONNREFUSED|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|socket hang up|premature close|timeout/i.test(text);
+      if (!retriable || attempt === 2) throw e;
+      stats.upstreamRetry = (stats.upstreamRetry ?? 0) + 1;
+      log('上游网络错误，重试第 ' + (attempt + 1) + ' 次：' + String(options.path).slice(0, 60) + ' ' + text.slice(0, 80));
+      diag('retry', options.path, text);
+      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+async function requestUpstreamOnce(options) {
   if (options._noAuth) return rawRequest(options);
   const first = await rawRequest(options);
   const status = first.res.statusCode;
@@ -706,6 +726,29 @@ function refreshListInBackground({ force = false } = {}) {
   return listRefreshInflight;
 }
 
+// ---------------------------------------------------------------- 客户端诊断上报
+// 网络问题导致请求失败时，把「哪条路径、什么错误」打到服务器的 access log（/client-diag?…），
+// 服务器侧就能看到客户端本机发生了什么，而不只是看它成功打到服务端的请求。
+let diagCount = 0;
+function diag(kind, path, error) {
+  try {
+    if (diagCount > 200) return;   // 防止断网时刷屏
+    diagCount += 1;
+    const q = new URLSearchParams({
+      k: String(kind || ''), p: String(path || '').slice(0, 120),
+      e: String(error || '').slice(0, 120), v: VERSION, c: CLIENT_ID,
+    });
+    const req = https.request({
+      hostname: UP_HOSTNAME, port: UP_PORT, path: `${UP_PATH_PREFIX}/client-diag?${q}`,
+      method: 'GET', headers: { authorization: AUTH, 'x-dsh-client': CLIENT_ID }, timeout: 4000,
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => {});
+    req.on('response', (r) => { r.resume(); });
+    req.end();
+  } catch {}
+}
+
 // ---------------------------------------------------------------- 缓存容量治理
 const MAX_CACHE_BYTES = Math.max(64, Number(cfg.maxCacheMb || 2048)) * 1024 * 1024;
 const WS_FOLLOW_DIR = path.join(CACHE_DIR, 'ws-follow');
@@ -1069,9 +1112,10 @@ function streamThrough(req, res, reqPath) {
     })
     .catch((error) => {
       log('透传失败', reqPath, String(error?.message ?? error));
+      diag('stream', reqPath, String(error?.message ?? error));
       try {
-        res.writeHead(502);
-        res.end('upstream error');
+        res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><meta charset="utf-8"><body style="background:#0f1115;color:#9aa4b2;font:14px system-ui;padding:24px">DSH 客户端：网络中断，正在自动重连…<script>setTimeout(()=>location.reload(),1500)</script></body>');
       } catch {}
     });
 }
@@ -1223,10 +1267,12 @@ function streamBufferUpstream(req, res, reqPath, body) {
       upRes.pipe(res);
       upRes.on('error', () => res.destroy());
     })
-    .catch(() => {
+    .catch((error) => {
+      log('API POST 失败', reqPath, String(error?.message ?? error));
+      diag('api', reqPath, String(error?.message ?? error));
       try {
-        res.writeHead(502);
-        res.end('upstream error');
+        res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: '网络中断，请重试', retry: true }));
       } catch {}
     });
 }
@@ -1478,6 +1524,26 @@ async function main() {
     log(`缓存目录: ${CACHE_DIR}`);
     log(`配置文件: ${process.env.DSH_CLIENT_CONFIG || path.join(baseDir(), 'config.json')}`);
     if (cfg.openBrowser && !process.argv.includes('--no-open')) openBrowser(url);
+    // 心跳：每 60 秒往服务器报一次状态（客户端"人还活着但黑屏"时能据此判断是哪台、什么版本、有没有报错）
+    setInterval(() => {
+      try {
+        const q = new URLSearchParams({
+          k: 'hb', v: VERSION, c: CLIENT_ID, port: String(cfg.port),
+          list: String(listIndex.size), staticH: String(stats.staticHit || 0), staticM: String(stats.staticMiss || 0),
+          authErr: String(stats.authError ? 1 : 0), retry: String(stats.upstreamRetry || 0),
+          relogin: String(stats.relogin || 0),
+        });
+        const req = https.request({
+          hostname: UP_HOSTNAME, port: UP_PORT, path: `${UP_PATH_PREFIX}/client-diag?${q}`,
+          method: 'GET', headers: { authorization: AUTH, 'x-dsh-client': CLIENT_ID }, timeout: 5000,
+        });
+        req.on('timeout', () => req.destroy());
+        req.on('error', () => {});
+        req.on('response', (r) => r.resume());
+        req.end();
+      } catch {}
+    }, 60000).unref?.();
+
     // 缓存容量治理：启动 5 秒后清一次，之后每 30 分钟一次
     setTimeout(() => { try { enforceCacheLimits(); } catch (e) { log('缓存清理异常', String(e && e.message).slice(0, 120)); } }, 5000);
     setInterval(() => { try { enforceCacheLimits(); } catch {} }, 30 * 60 * 1000).unref?.();

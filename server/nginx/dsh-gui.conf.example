@@ -211,6 +211,12 @@ server {
         try_files $uri $uri/ /m2/index.html;
         add_header Cache-Control "no-store";
     }
+    # 客户端诊断上报：只写 access log（含 ?k=&p=&e=&v=&c=），返回 204
+    location = /client-diag {
+        access_log /var/log/nginx/dsh-client-diag.log dsh_gui;
+        return 204;
+    }
+
     location = /m2/login {
         auth_basic off;
         auth_request /dshm-check;
