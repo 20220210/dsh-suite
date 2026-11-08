@@ -104,6 +104,11 @@ export function attachMux(options) {
 
   function relay(ws) {
     let upstream;
+    /** 上游断开时直接掐掉客户端连接（1006 异常关闭），不要发 1011+文字：
+     *  实测 DSH UI 收到 1011 “upstream error” 会把错误文字画在页面上并且不再重连（黑屏的直接原因）。 */
+    const killClient = () => {
+      try { ws.terminate(); } catch { try { ws.close(); } catch {} }
+    };
     try {
       upstream = new WebSocket(upstreamUrl, {
         headers: headers(),
@@ -113,9 +118,7 @@ export function attachMux(options) {
       });
     } catch (error) {
       log?.('mux 上游连接失败', String(error?.message ?? error));
-      try {
-        ws.close(1011, 'upstream unavailable');
-      } catch {}
+      killClient();
       return;
     }
 
@@ -225,16 +228,10 @@ export function attachMux(options) {
       } catch {}
     });
 
-    upstream.on('close', () => {
-      try {
-        ws.close(1011, 'upstream closed');
-      } catch {}
-    });
+    upstream.on('close', () => { killClient(); });
     upstream.on('error', (error) => {
       log?.('mux 上游错误', String(error?.message ?? error));
-      try {
-        ws.close(1011, 'upstream error');
-      } catch {}
+      killClient();
     });
 
     ws.on('message', async (data, isBinary) => {

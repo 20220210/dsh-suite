@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.5.1';
+const VERSION = '1.5.2';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
@@ -1026,17 +1026,26 @@ function proxyStatic(req, res, reqPath) {
         sendBuffer(res, upRes.statusCode, upRes.headers, body);
       });
       upRes.on('error', () => {
+        const stale = readStatic(key);
         try {
-          res.writeHead(502);
-          res.end('upstream error');
+          if (stale) return sendBuffer(res, 200, { ...stale.meta.headers, 'cache-control': 'no-cache' }, stale.body);
+          res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' });
+          res.end('<!doctype html><meta charset="utf-8"><body style="background:#0f1115;color:#9aa4b2;font:14px system-ui;padding:24px">DSH 客户端：连不上服务器，正在自动重试…<script>setTimeout(()=>location.reload(),2000)</script></body>');
         } catch {}
       });
     })
     .catch((error) => {
       log('静态代理失败', reqPath, String(error?.message ?? error));
+      // 上游不可达：退回磁盘上的旧副本（页面还能渲染，UI 自己会提示断线并重连）
+      const stale = readStatic(key);
+      if (stale) {
+        stats.staticHit += 1;
+        log('静态资源回退旧缓存', reqPath, stale.body.length + 'B');
+        try { return sendBuffer(res, 200, { ...stale.meta.headers, 'cache-control': 'no-cache' }, stale.body); } catch {}
+      }
       try {
-        res.writeHead(502);
-        res.end('upstream error');
+        res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><meta charset="utf-8"><body style="background:#0f1115;color:#9aa4b2;font:14px system-ui;padding:24px">DSH 客户端：连不上服务器，正在自动重试…<script>setTimeout(()=>location.reload(),2000)</script></body>');
       } catch {}
     });
 }
