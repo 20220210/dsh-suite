@@ -811,6 +811,24 @@ function createWindow() {
 
   mainWindow.loadURL(instUrl());
   // 首页偶尔会因本地代理刚起步/上游忙而加载失败（窗口就一片黑），这里自动重试几次
+  // 本地代理在上游不可达时可能返回一张「连不上服务器」的兜底页（HTTP 200，不算加载失败），
+  // 这种情况 did-fail-load 抓不到，这里读一次页面文本，发现是错误页就重载（指数退避，最多 8 秒）。
+  let errPageReloads = 0;
+  mainWindow.webContents.on('did-finish-load', () => {
+    setTimeout(async () => {
+      try {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        const txt = await mainWindow.webContents.executeJavaScript('document.body ? document.body.innerText.slice(0,300) : ""', true).catch(() => '');
+        const broken = typeof txt === 'string' && txt.length < 300 && /upstream error|连不上服务器/i.test(txt);
+        if (!broken) { errPageReloads = 0; return; }
+        errPageReloads += 1;
+        const delay = Math.min(1500 * errPageReloads, 8000);
+        mainLog(`检测到错误页，${delay}ms 后重载（第 ${errPageReloads} 次）：${txt.slice(0, 40)}`);
+        setTimeout(() => { try { if (!mainWindow.isDestroyed()) mainWindow.loadURL(instUrl()); } catch {} }, delay);
+      } catch {}
+    }, 800);
+  });
+
   mainWindow.webContents.on('did-fail-load', (_e, errorCode, errorDesc, validatedURL) => {
     try { mainLog(`页面加载失败 ${errorCode} ${errorDesc} ${validatedURL}，1.5 秒后重试`); } catch {}
     if (errorCode === -3) return; // 主动 abort（例如重载）不算失败
