@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.5.3';
+const VERSION = '1.5.4';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
@@ -1500,6 +1500,7 @@ attachMux({
   headers: muxHeaders,
   cacheDir: CACHE_DIR,
   getAsOfSeq: fetchAsOfSeq,   // 回放缓存前先核对序号，避免"回放后无法衔接"导致断线
+  getListItems: () => (Date.now() - (listIndexAt || 0) < 5 * 60 * 1000 ? listIndex : null),   // 给 UI 对齐会话运行状态用
   log,
   stats,
 });
