@@ -20,6 +20,13 @@ function logTo(file, message) {
 
 function extractZip(zipPath, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
+  // macOS/Linux：系统自带 unzip / bsdtar
+  if (process.platform !== 'win32') {
+    const un = spawnSync('unzip', ['-oq', zipPath, '-d', destDir], { timeout: 180000 });
+    if (un.status === 0) return { ok: true, via: 'unzip' };
+    const tar = spawnSync('tar', ['-xf', zipPath, '-C', destDir], { timeout: 180000 });
+    return { ok: tar.status === 0, via: 'tar', error: String(tar.stderr || un.stderr || '') };
+  }
   // Windows 10/11 自带 tar.exe（bsdtar，可直接解 zip）；失败再退回 PowerShell Expand-Archive
   const tar = spawnSync('tar.exe', ['-xf', zipPath, '-C', destDir], { windowsHide: true, timeout: 120000 });
   if (tar.status === 0) return { ok: true, via: 'tar' };

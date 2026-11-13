@@ -182,8 +182,18 @@ function createUpdater(options) {
       return { manifest, kind: 'skipped' };
     }
     const contiguous = !manifest.electron || String(manifest.electron) === currentElectron();
-    const useFull = manifest.forceFull === true || !manifest.app || !contiguous;
-    const target = useFull ? manifest.full : manifest.app;
+    // 按平台选包：新清单用 platforms.{win32-x64|darwin-arm64}.{app,full}，老清单回退到 app/full
+    const platformKey = `${process.platform}-${process.arch}`;
+    const plat = manifest.platforms && manifest.platforms[platformKey] ? manifest.platforms[platformKey] : null;
+    const appTarget = plat ? plat.app : manifest.app;
+    const fullTarget = plat ? plat.full : manifest.full;
+    const useFull = manifest.forceFull === true || !appTarget || !contiguous;
+    // 非 Windows 平台：清单里没有对应平台的整包就别整包更新，避免装错平台
+    if (process.platform !== 'win32' && useFull && !plat) {
+      log(`清单里没有 ${platformKey} 的整包，跳过本次更新`);
+      return null;
+    }
+    const target = useFull ? fullTarget : appTarget;
     if (!target || !target.url) return null;
     return { manifest, kind: useFull ? 'full' : 'app', target };
   }

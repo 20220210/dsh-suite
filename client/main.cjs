@@ -255,6 +255,7 @@ function windowIconPath() {
 }
 
 function trayIconPath() {
+  if (process.platform === 'darwin') return path.join(__dirname, 'assets', 'icon-black-256.png');
   return path.join(__dirname, 'assets', isDarkTheme() ? 'tray-white.ico' : 'tray-black.ico');
 }
 
@@ -401,6 +402,23 @@ function promptPassword(reason) {
 
 // 清扫占着本地代理端口的残留进程（应用被强杀后子进程可能变成孤儿）
 function killPortOwner(port) {
+  if (process.platform === 'darwin') {
+    try {
+      const lsof = spawnSync('lsof', ['-ti', `:${port}`, '-sTCP:LISTEN'], { timeout: 8000, encoding: 'utf8' });
+      const pids = String(lsof.stdout || '').split(/\s+/).filter((x) => /^\d+$/.test(x));
+      for (const pid of pids) {
+        const info = spawnSync('ps', ['-p', pid, '-o', 'comm='], { timeout: 5000, encoding: 'utf8' });
+        const name = String(info.stdout || '').trim();
+        if (!name) continue;
+        if (!/electron|dsh|node/i.test(name)) { mainLog(`端口 ${port} 被其它程序占用（${name} pid=${pid}），不处理`); continue; }
+        spawnSync('kill', ['-9', pid], { timeout: 8000 });
+        mainLog(`已清理占用端口 ${port} 的残留进程 ${name} pid=${pid}`);
+      }
+    } catch (e) {
+      mainLog('清理端口失败 ' + String(e && e.message));
+    }
+    return;
+  }
   if (process.platform !== 'win32') return;
   try {
     const ps = spawnSync('powershell.exe', ['-NoProfile', '-Command',
@@ -557,17 +575,26 @@ function autostartEnabled() {
 
 function setAutostart(enabled) {
   try {
-    app.setLoginItemSettings({ openAtLogin: Boolean(enabled), path: process.execPath, args: [] });
+    if (process.platform === 'darwin') {
+      app.setLoginItemSettings({ openAtLogin: Boolean(enabled) });
+    } else {
+      app.setLoginItemSettings({ openAtLogin: Boolean(enabled), path: process.execPath, args: [] });
+    }
   } catch (error) {
     console.error('设置开机自启失败', error);
   }
 }
 
 function setupTray() {
-  if (process.platform !== 'win32' || tray) return;
+  if (process.platform !== 'win32' && process.platform !== 'darwin') return;
+  if (tray) return;
   try {
     const iconPath = trayIconPath();
-    const image = fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
+    let image = fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : nativeImage.createEmpty();
+    if (process.platform === 'darwin' && !image.isEmpty()) {
+      image = image.resize({ width: 18, height: 18 });
+      image.setTemplateImage(true);   // 黑色+透明 → 菜单栏自动适配深浅色
+    }
     tray = new Tray(image);
     tray.setToolTip('DSH 桌面版');
     mainLog(`托盘图标 ${image.isEmpty() ? '加载失败' : `已加载 ${image.getSize().width}x${image.getSize().height}`}（${isDarkTheme() ? '深色' : '浅色'}主题）`);
@@ -780,12 +807,12 @@ function setupUpdater() {
 
   // 启动后先等页面正常显示，再静默检查一次
   setTimeout(() => {
-    if (process.platform === 'win32') updater.check({ manual: false });
+    if (process.platform === 'win32' || process.platform === 'darwin') updater.check({ manual: false });
   }, 20000);
 
   clearInterval(checkTimer);
   checkTimer = setInterval(() => {
-    if (process.platform === 'win32') updater.check({ manual: false });
+    if (process.platform === 'win32' || process.platform === 'darwin') updater.check({ manual: false });
   }, everyMs);
   checkTimer.unref?.();
 }
