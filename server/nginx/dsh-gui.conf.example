@@ -1,5 +1,7 @@
 # DSH Web GUI 的公网 HTTPS 入口（只走 nginx 反代，不占用 ssh）
 # 访问: https://tnty.9017i.cc:19306/  需要 Basic Auth 密码 + DSH token
+limit_req_zone $binary_remote_addr zone=clientdiag:1m rate=5r/s;
+
 # 会话列表：优先缓存层，缓存层挂了自动回源 DSH（慢约 100 秒，但不会 502 白屏）
 upstream dsh_session_list {
     server 127.0.0.1:19402 max_fails=2 fail_timeout=15s;
@@ -212,7 +214,9 @@ server {
         add_header Cache-Control "no-store";
     }
     # 客户端诊断上报：只写 access log（含 ?k=&p=&e=&v=&c=），返回 204
+    # 限速：即使 URL 泄露，也不能被匿名刷爆诊断日志（5r/s 突发 20）
     location = /client-diag {
+        limit_req zone=clientdiag burst=20 nodelay;
         access_log /var/log/nginx/dsh-client-diag.log dsh_gui;
         return 204;
     }

@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.5.4';
+const VERSION = '1.5.5';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
@@ -385,6 +385,11 @@ async function requestUpstreamOnce(options) {
 /** 登录：GET /?token=... 拿 dsh-auth cookie。 */
 async function login(attempt = 0) {
   try {
+    // 首次启动（或没保存过 token）时：先用 BasicAuth 找 bridge 换当前 token，否则 /?token= 是空值必失败
+    if (!LOGIN_TOKEN) {
+      const boot = await fetchTokenFromBridge();
+      if (boot) { LOGIN_TOKEN = boot; saveTokenHint(boot); log('首次登录：已从 bridge 获取当前 token'); }
+    }
     const { res } = await requestUpstream({
       method: 'GET',
       path: '/?token=' + encodeURIComponent(LOGIN_TOKEN),
@@ -404,11 +409,13 @@ async function login(attempt = 0) {
         return true;
       }
     }
-    // 已有 cookie 也可能有效：试一次 session/list
-    const ok = await probeSessionList();
-    if (ok) {
-      log('已有 cookie 有效，跳过重新登录');
-      return true;
+    // 已有 cookie 也可能有效：只有真的存过 cookie 才探测（没有 cookie 时 DSH 对 session/list 放行，会造成误判）
+    if (sessionCookie) {
+      const ok = await probeSessionList();
+      if (ok) {
+        log('已有 cookie 有效，跳过重新登录');
+        return true;
+      }
     }
     log(`登录失败（status=${status}，set-cookie=${setCookie ? '有' : '无'}）`);
     if (attempt === 0) {
