@@ -46,7 +46,17 @@ function hostOf(url) {
 }
 
 function updaterWorkDir() {
-  const base = process.env.LOCALAPPDATA || process.env.TEMP || '/tmp';
+  // 必须和 main.cjs 里 applyPendingUpdate 的 workDir 一致，否则下载完的包永远不会被应用
+  // Windows: %LOCALAPPDATA%\dsh-client\updater；macOS: ~/Library/Application Support/<app>/dsh-client/updater
+  let base = process.env.LOCALAPPDATA;
+  if (!base) {
+    try {
+      const { app } = require('electron');
+      base = app.getPath('userData');
+    } catch {
+      base = process.env.TMPDIR || process.env.TEMP || '/tmp';
+    }
+  }
   return path.join(base, 'dsh-client', 'updater');
 }
 
