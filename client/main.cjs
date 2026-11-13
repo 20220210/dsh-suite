@@ -526,6 +526,15 @@ function proxyInfo(idx = currentInst) {
 function killStaleProxy(pid) {
   if (!pid) return;
   try {
+    if (process.platform !== 'win32') {
+      // macOS/Linux：确认是自家进程再杀，避免误杀同号进程
+      const ps = spawnSync('ps', ['-p', String(pid), '-o', 'comm='], { timeout: 5000, encoding: 'utf8' });
+      const name = String(ps.stdout || '').trim();
+      if (!name || !/electron|dsh|node/i.test(name)) { mainLog(`旧代理 pid=${pid} 进程名不符（${name || '未知'}），跳过`); return; }
+      spawnSync('kill', ['-9', String(pid)], { timeout: 8000 });
+      mainLog(`已清理旧代理 pid=${pid}（${name}）`);
+      return;
+    }
     require('node:child_process').spawnSync('taskkill.exe', ['/PID', String(pid), '/F'], { windowsHide: true, timeout: 10000 });
   } catch {}
 }

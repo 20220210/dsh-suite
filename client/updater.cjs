@@ -23,9 +23,13 @@ function logLine(file, message) {
 }
 
 function parseVersion(text) {
-  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(text || '').trim());
+  // 允许 1 / 1.2 / 1.2.3 三种写法（缺的位补 0），避免清单里写 "2.0" 被判成无效版本
+  const m = /^(\d+)(?:\.(\d+))?(?:\.(\d+))?/.exec(String(text || '').trim());
   if (!m) return null;
-  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]), text: `${m[1]}.${m[2]}.${m[3]}` };
+  const major = Number(m[1]);
+  const minor = Number(m[2] || 0);
+  const patch = Number(m[3] || 0);
+  return { major, minor, patch, text: `${major}.${minor}.${patch}` };
 }
 
 function isNewer(candidate, current) {
