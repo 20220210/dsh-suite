@@ -38,7 +38,7 @@ d.update({
     'CFBundleShortVersionString': version,
     'CFBundleVersion': version,
     'CFBundleIconFile': 'dsh',
-    'LSMinimumSystemVersion': '12.0',
+    'LSMinimumSystemVersion': '13.0',
     'NSHighResolutionCapable': True,
     'LSApplicationCategoryType': 'public.app-category.productivity',
 })
@@ -74,7 +74,7 @@ DSH Desktop（macOS 未签名版）
 1) 把 DSH Desktop.app 拖到「应用程序」文件夹
 2) 首次打开：右键点图标 → 打开 → 再点「打开」（未签名，系统会拦一次）
    或者终端执行：xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"
-3) 首次运行会弹密码框，输入 DSH 访问密码
+3) 需要 macOS 13 或更高版本；首次运行会弹密码框，输入 DSH 访问密码
 4) 开机自启 / 自动更新 在菜单栏托盘图标里
 EOF
 cp "$WORK/使用说明-mac.txt" "$APPB/使用说明-mac.txt" 2>/dev/null || true
