@@ -1218,6 +1218,18 @@ async function switchInstance(i) {
 
 function buildMenu() {
   const template = [
+    ...(process.platform === 'darwin' ? [{
+      label: 'DSH Desktop',
+      submenu: [
+        { role: 'about', label: '关于 DSH Desktop' },
+        { type: 'separator' },
+        { role: 'hide', label: '隐藏' },
+        { role: 'hideOthers', label: '隐藏其它' },
+        { role: 'unhide', label: '显示全部' },
+        { type: 'separator' },
+        { role: 'quit', label: '退出 DSH Desktop' },
+      ],
+    }] : []),
     {
       label: '文件',
       submenu: [
