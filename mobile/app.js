@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '148';   // 部署时由脚本替换成时间戳
+const BUILD = '149';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -843,7 +843,7 @@ function openFollow(sessionId) {
   ws.__buf = ''; state.followWs = ws;
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'open', streamId: 'follow', endpoint: 'session/follow',
-      payload: { args: { request: { address: { kind: 'session', sessionId }, assistantStream: true, maxMessages: 24 } } } }));
+      payload: { args: { request: { address: { kind: 'session', sessionId }, assistantStream: true, maxMessages: 48 } } } }));
   };
   ws.onmessage = (ev) => {
     let f; try { f = JSON.parse(ev.data); } catch { return; }
@@ -933,7 +933,9 @@ function renderRecord(rec, box) {
       if (!txt && !think) break;
       if (think && state.turnStart) {
         if (!state.thinkRow || state.thinkRow.streamed === 0) appendThink(think);
-      } else if (think && !state.turnStart) {
+      } else if (think && !state.turnStart && txt) {
+        // 只有同时有正文的助手消息才单独成块；断点窗口截断时，工具步骤的中间推理不再每步渲染一个
+        // “已完成 · N 字”（否则重进长会话会出现一墙折叠块，见 2026-11-17 反馈）
         const det = document.createElement('details');
         det.className = 'think turn-think';
         const sum = document.createElement('summary');
