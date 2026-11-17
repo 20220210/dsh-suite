@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '149';   // 部署时由脚本替换成时间戳
+const BUILD = '150';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -774,6 +774,7 @@ function showView(name) {
   $('#view-list').hidden = chat;
   $('#back').hidden = !chat;
   const nc = $('#newchat'); if (nc) nc.hidden = chat;
+  const fb = $('#files'); if (fb) fb.hidden = !chat;
   if (!chat) {
     $('#title').textContent = 'DSH'; stopTicker();
     // iOS 上 display:none 恢复显示后，滚动层要等一次布局才吃手势（表现为「第一下滑不动」）。
@@ -1519,6 +1520,121 @@ function appendThink(text) {
   if (r.el.open) scrollBottom();
 }
 
+/* ---------- 文件浏览 / 下载（workspaceFiles API） ---------- */
+const FILE_CHUNK = 8 * 1024 * 1024;
+const FILE_MIME = { txt:'text/plain', md:'text/markdown', json:'application/json', js:'text/javascript', mjs:'text/javascript', ts:'text/plain', html:'text/html', css:'text/css', yml:'text/yaml', yaml:'text/yaml', log:'text/plain', csv:'text/csv', xml:'text/xml', sh:'text/x-shellscript', py:'text/x-python', zip:'application/zip', gz:'application/gzip', tar:'application/x-tar', '7z':'application/x-7z-compressed', pdf:'application/pdf', png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', webp:'image/webp', gif:'image/gif', mp4:'video/mp4', mp3:'audio/mpeg', docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation' };
+let fsPath = '.';
+let fsLoading = false;
+
+/** 二进制 RPC：返回 multipart（bytes-0 文件 + metadata JSON），这里解析成 Blob */
+async function rpcBinary(method, args) {
+  const body = JSON.stringify({ type: 'client-request', rpcId: rid(), method, payload: { args } });
+  const res = await fetch(`${API_BASE}/api/${method}`, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' }, body,
+  });
+  const ctype = res.headers.get('content-type') || '';
+  if (/multipart\/form-data/i.test(ctype)) {
+    const fd = await res.formData();
+    const meta = JSON.parse(String(fd.get('metadata') || '{}'));
+    if (!meta.result || meta.result.ok !== true) throw new Error(meta.result?.error?.message || ('读取失败 HTTP ' + res.status));
+    return { value: meta.result.value, blob: fd.get('bytes-0') };
+  }
+  let j = null; try { j = await res.json(); } catch {}
+  if (!j || !j.result || j.result.ok !== true) throw new Error(j?.result?.error?.message || ('HTTP ' + res.status));
+  return { value: j.result.value, blob: null };
+}
+
+function fmtFileSize(n) {
+  if (typeof n !== 'number') return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+function joinPath(parent, name) {
+  if (!parent || parent === '.') return name;
+  return parent.replace(/\/+$/, '') + '/' + name;
+}
+
+async function openFilesSheet() {
+  if (!state.sessionId) return;
+  fsPath = '.';
+  $('#filesheet').hidden = false;
+  await loadFileList('.');
+}
+function closeFilesSheet() { $('#filesheet').hidden = true; }
+
+async function loadFileList(path) {
+  if (fsLoading) return;
+  fsLoading = true;
+  const box = $('#fs-list');
+  box.replaceChildren(el('div', 'empty', '加载中…'));
+  $('#fs-path').textContent = path === '.' ? '工作区根目录' : path;
+  try {
+    const v = await rpc('workspaceFiles/list', { workspaceFileScopeId: state.sessionId, path });
+    const entries = (v && v.entries) || [];
+    fsPath = path;
+    box.replaceChildren();
+    if (path !== '.') {
+      const up = el('div', 'fs-row');
+      up.append(el('span', 'ic', '⬆️'), el('span', 'nm', '..'));
+      up.onclick = () => { const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '.'; loadFileList(parent); };
+      box.append(up);
+    }
+    if (!entries.length) { box.append(el('div', 'empty', '空目录')); return; }
+    entries.sort((a, b) => (b.type === 'directory') - (a.type === 'directory') || String(a.name).localeCompare(String(b.name)));
+    for (const ent of entries) {
+      const row = el('div', 'fs-row');
+      const isDir = ent.type === 'directory';
+      row.append(el('span', 'ic', isDir ? '📁' : '📄'), el('span', 'nm', ent.name));
+      if (!isDir && typeof ent.size === 'number') row.append(el('span', 'sz', fmtFileSize(ent.size)));
+      row.onclick = () => {
+        if (isDir) { loadFileList(joinPath(path, ent.name)); return; }
+        if (ent.type !== 'file') { toast('这个条目不可下载', 2000); return; }
+        downloadWorkspaceFile(joinPath(path, ent.name), ent.name).catch((e) => toast('下载失败：' + e.message, 5000));
+      };
+      box.append(row);
+    }
+  } catch (e) {
+    box.replaceChildren(el('div', 'empty', '读取失败：' + e.message));
+  } finally { fsLoading = false; }
+}
+
+async function readWorkspaceBytes(path, size) {
+  const chunks = [];
+  let offset = 0;
+  const total = Number(size) || 0;
+  for (;;) {
+    const opts = total > 0 ? { range: { offset, length: Math.min(FILE_CHUNK, total - offset) } } : {};
+    const r = await rpcBinary('workspaceFiles/readBytes', { workspaceFileScopeId: state.sessionId, path, options: opts });
+    if (r.blob && r.blob.size) chunks.push(r.blob);
+    const v = r.value || {};
+    if (v.eof === true || !r.blob || !r.blob.size) break;
+    offset += r.blob.size;
+    if (!total && offset > 200 * 1024 * 1024) throw new Error('文件太大（>200MB）');
+    if (total && offset >= total) break;
+  }
+  return new Blob(chunks);
+}
+
+async function downloadWorkspaceFile(path, name) {
+  toast('准备下载：' + name, 1500);
+  let size = null;
+  try { const st = await rpc('workspaceFiles/stat', { workspaceFileScopeId: state.sessionId, path }); size = st && st.bytes; } catch {}
+  if (size && size > 200 * 1024 * 1024) { toast('文件太大（' + fmtFileSize(size) + '），暂不支持手机下载', 4000); return; }
+  const blob = await readWorkspaceBytes(path, size);
+  const ext = String(name).split('.').pop().toLowerCase();
+  const typed = blob.type ? blob : new Blob([blob], { type: FILE_MIME[ext] || 'application/octet-stream' });
+  const url = URL.createObjectURL(typed);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.rel = 'noopener';
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  toast('已开始下载：' + name, 2000);
+}
+
 /* ---------- 等待区（排队消息） ---------- */
 function renderQueue() {
   const box = $('#queue'); if (!box) return;
@@ -1854,6 +1970,10 @@ window.addEventListener('popstate', () => {
 });
 $('#newchat').onclick = () => createSession(null);
 $('#bell').onclick = () => togglePush().catch(() => {});
+const filesBtn = $('#files');
+if (filesBtn) filesBtn.onclick = () => openFilesSheet().catch((e) => toast('打开文件失败：' + e.message, 4000));
+const fsClose = $('#fs-close'); if (fsClose) fsClose.onclick = () => closeFilesSheet();
+const fsMask = $('#filesheet')?.querySelector('.fs-mask'); if (fsMask) fsMask.onclick = () => closeFilesSheet();
 updateBell().catch(() => {});
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('message', (ev) => {
