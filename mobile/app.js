@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '155';   // 部署时由脚本替换成时间戳
+const BUILD = '156';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -732,6 +732,8 @@ async function openSession(it) {
   showView('chat');
   updateJumpBtn();
   $('#messages').replaceChildren(el('div', 'empty', '加载中…'));
+  rendered.clear();
+  state.suppressScroll = false;
   state.view = 'chat';
   clearLiveBubbles(); setRunning(false); clearThinkLine();
   const tk = $('#tasks'); if (tk) { tk.replaceChildren(); tk.hidden = true; }
@@ -873,17 +875,24 @@ const rendered = new Set();
 function onFollowValue(v) {
   if (!v) return;
   if (v.type === 'snapshot') {
-    // 重连/刷新会整块重放快照：如果用户正在往上翻，按锚点对位还原；只有贴底时才回到底部
+    // 快照按增量合并：首次进入才清空重建；重连时只补没渲染过的记录。
+    // 这样 DOM 基本不动，用户翻到哪儿就停在哪儿（之前整块重建 + 各种吸附是跳底根源）。
     const box = $('#messages');
+    const firstLoad = rendered.size === 0;
     const wasPinned = pinnedBottom;
-    const anchor = wasPinned ? null : captureScrollAnchor();
-    state.suppressScroll = true;          // 重建期间 renderRecord 里的吸附/延迟跳全部禁用
-    box.replaceChildren();
-    rendered.clear();
+    state.suppressScroll = true;
+    if (firstLoad) {
+      box.replaceChildren();
+    } else {
+      // 流式草稿气泡没有 seq，durable 记录会补全；重连时先清掉免得重复
+      for (const n of box.querySelectorAll('.msg.live')) n.remove();
+      state.live = null;
+      const ph = box.querySelector('.empty'); if (ph) ph.remove();
+    }
     for (const r of v.records || []) renderRecord(r, box);
     state.suppressScroll = false;
-    if (wasPinned || !anchor) scrollBottom(true);
-    else { restoreScrollAnchor(anchor); updatePinnedBottom(); }
+    if (firstLoad || wasPinned) scrollBottom(true);
+    // 否则什么都不做：scrollTop 原样保留
     updateJumpBtn();
     return;
   }
