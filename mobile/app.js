@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '154';   // 部署时由脚本替换成时间戳
+const BUILD = '155';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -875,12 +875,15 @@ function onFollowValue(v) {
   if (v.type === 'snapshot') {
     // 重连/刷新会整块重放快照：如果用户正在往上翻，按锚点对位还原；只有贴底时才回到底部
     const box = $('#messages');
-    const anchor = pinnedBottom ? null : captureScrollAnchor();
+    const wasPinned = pinnedBottom;
+    const anchor = wasPinned ? null : captureScrollAnchor();
+    state.suppressScroll = true;          // 重建期间 renderRecord 里的吸附/延迟跳全部禁用
     box.replaceChildren();
     rendered.clear();
     for (const r of v.records || []) renderRecord(r, box);
-    if (pinnedBottom || !anchor) scrollBottom(true);
-    else restoreScrollAnchor(anchor);
+    state.suppressScroll = false;
+    if (wasPinned || !anchor) scrollBottom(true);
+    else { restoreScrollAnchor(anchor); updatePinnedBottom(); }
     updateJumpBtn();
     return;
   }
@@ -1125,10 +1128,15 @@ function restoreScrollAnchor(anchor) {
 
 function scrollBottom(force) {
   const m = $('#messages'); if (!m) return;
+  if (state.suppressScroll && !force) return;
   const near = m.scrollHeight - m.scrollTop - m.clientHeight < 200;
   if (!force && !near) return;
   // 视图刚切过来 / 内容刚插入时高度还没算好，赋值会落空，所以多补几次
-  const jump = () => { try { m.scrollTo({ top: m.scrollHeight, behavior: 'instant' }); } catch { m.scrollTop = m.scrollHeight; } };
+  const jump = () => {
+    if (state.suppressScroll && !force) return;          // 快照重建中：不许任何延迟跳
+    if (!force && !pinnedBottom) return;                  // 用户已经翻上去：延迟帧也不许拽回底部
+    try { m.scrollTo({ top: m.scrollHeight, behavior: 'instant' }); } catch { m.scrollTop = m.scrollHeight; }
+  };
   jump();
   requestAnimationFrame(jump);
   setTimeout(jump, 120);
