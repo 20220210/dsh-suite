@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '150';   // 部署时由脚本替换成时间戳
+const BUILD = '151';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -1521,7 +1521,7 @@ function appendThink(text) {
 }
 
 /* ---------- 文件浏览 / 下载（workspaceFiles API） ---------- */
-const FILE_CHUNK = 8 * 1024 * 1024;
+const FILE_CHUNK = 2 * 1024 * 1024;  // DSH readBytes 单次上限 2MB（实测 2097152），不能再大
 const FILE_MIME = { txt:'text/plain', md:'text/markdown', json:'application/json', js:'text/javascript', mjs:'text/javascript', ts:'text/plain', html:'text/html', css:'text/css', yml:'text/yaml', yaml:'text/yaml', log:'text/plain', csv:'text/csv', xml:'text/xml', sh:'text/x-shellscript', py:'text/x-python', zip:'application/zip', gz:'application/gzip', tar:'application/x-tar', '7z':'application/x-7z-compressed', pdf:'application/pdf', png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', webp:'image/webp', gif:'image/gif', mp4:'video/mp4', mp3:'audio/mpeg', docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation' };
 let fsPath = '.';
 let fsLoading = false;
@@ -1611,12 +1611,15 @@ async function readWorkspaceBytes(path, size) {
     const r = await rpcBinary('workspaceFiles/readBytes', { workspaceFileScopeId: state.sessionId, path, options: opts });
     if (r.blob && r.blob.size) chunks.push(r.blob);
     const v = r.value || {};
+    offset += (r.blob && r.blob.size) || 0;
+    if (total > 0) toast('下载中 ' + Math.min(100, Math.round((offset / total) * 100)) + '%（' + fmtFileSize(offset) + ' / ' + fmtFileSize(total) + '）', 8000);
     if (v.eof === true || !r.blob || !r.blob.size) break;
-    offset += r.blob.size;
-    if (!total && offset > 200 * 1024 * 1024) throw new Error('文件太大（>200MB）');
     if (total && offset >= total) break;
+    if (!total && offset > 200 * 1024 * 1024) throw new Error('文件太大（>200MB）');
   }
-  return new Blob(chunks);
+  const blob = new Blob(chunks);
+  if (total > 0 && blob.size !== total) throw new Error('文件不完整（' + fmtFileSize(blob.size) + ' / ' + fmtFileSize(total) + '），已取消保存');
+  return blob;
 }
 
 async function downloadWorkspaceFile(path, name) {
@@ -1626,8 +1629,19 @@ async function downloadWorkspaceFile(path, name) {
   if (size && size > 200 * 1024 * 1024) { toast('文件太大（' + fmtFileSize(size) + '），暂不支持手机下载', 4000); return; }
   const blob = await readWorkspaceBytes(path, size);
   const ext = String(name).split('.').pop().toLowerCase();
-  const typed = blob.type ? blob : new Blob([blob], { type: FILE_MIME[ext] || 'application/octet-stream' });
-  const url = URL.createObjectURL(typed);
+  const mime = FILE_MIME[ext] || 'application/octet-stream';
+  const file = new File([blob], name, { type: mime });
+  // iOS Safari：a[download] 常被忽略 / 存成 0KB，优先走系统分享面板（可「存储到文件」）
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: name });
+      toast('已发送到系统分享/存储：' + name, 2500);
+      return;
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;   // 用户取消分享，不算失败
+  }
+  const url = URL.createObjectURL(file);
   const a = document.createElement('a');
   a.href = url; a.download = name; a.rel = 'noopener';
   document.body.append(a); a.click(); a.remove();
