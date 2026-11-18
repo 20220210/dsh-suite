@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '151';   // 部署时由脚本替换成时间戳
+const BUILD = '152';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -873,11 +873,15 @@ const rendered = new Set();
 function onFollowValue(v) {
   if (!v) return;
   if (v.type === 'snapshot') {
-    $('#messages').replaceChildren();
-    rendered.clear();
+    // 重连/刷新会整块重放快照：如果用户正在往上翻，按锚点对位还原；只有贴底时才回到底部
     const box = $('#messages');
+    const anchor = pinnedBottom ? null : captureScrollAnchor();
+    box.replaceChildren();
+    rendered.clear();
     for (const r of v.records || []) renderRecord(r, box);
-    scrollBottom(true);
+    if (pinnedBottom || !anchor) scrollBottom(true);
+    else restoreScrollAnchor(anchor);
+    updateJumpBtn();
     return;
   }
   if (v.type === 'event') { renderRecord(v, $('#messages')); scrollBottom(); return; }
@@ -1085,6 +1089,38 @@ function updateJumpBtn() {
   const away = m.scrollHeight - m.scrollTop - m.clientHeight;
   const show = state.view === 'chat' && away > 200;
   if (b.hidden !== !show) b.hidden = !show;
+}
+
+/* 贴底状态：用户主动往上翻后，重连/刷新快照不能把它拽回最下面 */
+let pinnedBottom = true;
+function updatePinnedBottom() {
+  const m = $('#messages'); if (!m) return;
+  pinnedBottom = m.scrollHeight - m.scrollTop - m.clientHeight < 120;
+}
+
+/** 记下“当前第一个可见消息”的 seq 和它距容器顶部的偏移，快照重建后用它对位 */
+function captureScrollAnchor() {
+  const m = $('#messages'); if (!m) return null;
+  const box = m.getBoundingClientRect();
+  for (const c of m.children) {
+    const r = c.getBoundingClientRect();
+    if (r.bottom > box.top + 2) {
+      return { seq: (c.dataset && c.dataset.seq) || null, offset: Math.round(r.top - box.top) };
+    }
+  }
+  return null;
+}
+
+/** 快照重建后还原阅读位置（找不到锚点就保持不动，绝不强行拉到底） */
+function restoreScrollAnchor(anchor) {
+  const m = $('#messages'); if (!m || !anchor) return;
+  if (!anchor.seq) { m.scrollTop = 0; return; }
+  let el = null;
+  try { el = m.querySelector('[data-seq="' + anchor.seq + '"]'); } catch {}
+  if (!el) return;
+  const box = m.getBoundingClientRect();
+  const delta = Math.round(el.getBoundingClientRect().top - box.top) - anchor.offset;
+  if (delta) m.scrollTop = Math.max(0, m.scrollTop + delta);
 }
 
 function scrollBottom(force) {
@@ -1728,7 +1764,7 @@ function clampComposer() {
   const rect = comp.getBoundingClientRect();
   const delta = Math.round(rect.bottom - targetBottom);
   if (Math.abs(delta) <= 6) return;
-  if (Math.abs(delta) > 400) { root.style.setProperty('--vv-top', '0px'); return; }  // 异常值不复用
+  // 异常值不再直接清零（清零会让输入框掉到键盘后面），统一按 ±300 限幅处理
   const curTop = parseFloat(getComputedStyle(app).getPropertyValue('--vv-top')) || 0;
   const next = Math.max(-300, Math.min(300, curTop - delta));
   root.style.setProperty('--vv-top', Math.round(next) + 'px');
@@ -2008,7 +2044,13 @@ $('#sessions').addEventListener('touchcancel', () => {
   state.touching = false;
   if (state.pendingListPaint) { const f = state.pendingListPaint; state.pendingListPaint = null; setTimeout(f, 30); }
 }, { passive: true });
-$('#messages').addEventListener('scroll', updateJumpBtn, { passive: true });
+$('#messages').addEventListener('scroll', () => { updatePinnedBottom(); updateJumpBtn(); }, { passive: true });
+// 键盘弹起/收起后主动校准，防止输入框被推到屏幕外（iOS 上事件偶尔丢）
+const inputEl = $('#input');
+if (inputEl) {
+  inputEl.addEventListener('focus', () => { setTimeout(() => { syncViewport(); scheduleClamp(); }, 320); });
+  inputEl.addEventListener('blur', () => { setTimeout(() => { syncViewport(); }, 120); });
+}
 $('#jumpbtn').onclick = () => { scrollBottom(true); updateJumpBtn(); };
 $('#input').addEventListener('focus', () => { setTimeout(syncViewport, 120); setTimeout(syncViewport, 420); });
 $('#input').addEventListener('blur', () => { setTimeout(syncViewport, 120); setTimeout(syncViewport, 420); });
@@ -2176,7 +2218,7 @@ function syncViewport() {
   const keyboardOpen = !guarded && (baseH - Math.min(window.innerHeight, h) > 120);
   if (keyboardOpen) {
     root.style.setProperty('--app-h', h + 'px');
-    root.style.setProperty('--vv-top', Math.round(vv ? (vv.offsetTop || 0) : 0) + 'px');
+    root.style.setProperty('--vv-top', '0px');   // 只调高度，不再平移整页（平移会把输入框推出屏幕）
   } else {
     const closedH = (baseH > 300 ? baseH : window.innerHeight) || window.innerHeight;
     root.style.setProperty('--app-h', Math.max(300, Math.round(closedH)) + 'px');
@@ -2186,7 +2228,7 @@ function syncViewport() {
   scheduleClamp();
   const elv = $('#ver');
   if (elv) elv.textContent = 'v' + BUILD;
-  if (state.view === 'chat') scrollBottom(true);
+  if (state.view === 'chat' && pinnedBottom) scrollBottom();
 }
 
 if (window.visualViewport) {
