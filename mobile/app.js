@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '152';   // 部署时由脚本替换成时间戳
+const BUILD = '154';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -1750,24 +1750,13 @@ function spliceQueue(d2) {
 /* 保险：输入栏必须落在可视区里。若被推出（或上面留了大空），自动修正偏移 */
 let clampTimer = null;
 function clampComposer() {
-  const vv = window.visualViewport;
-  const comp = $('#composer'), app = document.getElementById('app');
-  const root = document.documentElement;
-  if (!comp || !app) return;
-  // 键盘收起时必须完全复位，否则可能把整页推出屏幕（黑屏）
+  // 现在 app 的高度和纵向偏移都直接跟着 visualViewport 走，输入框恒在可视区底部，
+  // 这里只做兜底：键盘收起时把可能残留的偏移复位。
+  const app = document.getElementById('app');
+  if (!app) return;
   if (!document.body.classList.contains('kb-open')) {
-    root.style.setProperty('--vv-top', '0px');
-    return;
+    document.documentElement.style.setProperty('--vv-top', '0px');
   }
-  if (!vv) return;
-  const targetBottom = Math.round(vv.height);
-  const rect = comp.getBoundingClientRect();
-  const delta = Math.round(rect.bottom - targetBottom);
-  if (Math.abs(delta) <= 6) return;
-  // 异常值不再直接清零（清零会让输入框掉到键盘后面），统一按 ±300 限幅处理
-  const curTop = parseFloat(getComputedStyle(app).getPropertyValue('--vv-top')) || 0;
-  const next = Math.max(-300, Math.min(300, curTop - delta));
-  root.style.setProperty('--vv-top', Math.round(next) + 'px');
 }
 function scheduleClamp() {
   clearTimeout(clampTimer);
@@ -2152,9 +2141,8 @@ document.addEventListener('visibilitychange', () => {
   // 锁屏解锁后视口参数会短暂错乱：先复位，再在两次延迟后校准
   resumedAt = Date.now();
   baseH = Math.max(baseH, window.innerHeight);
-  document.documentElement.style.setProperty('--app-h', baseH + 'px');
-  document.documentElement.style.setProperty('--vv-top', '0px');
   document.body.classList.remove('kb-open');
+  syncViewport();
   setTimeout(syncViewport, 60);
   setTimeout(syncViewport, 400);
   setTimeout(syncViewport, 1400);
@@ -2211,21 +2199,18 @@ let baseH = window.innerHeight;   // 无键盘时的基准高度（取见过的�
 function syncViewport() {
   const vv = window.visualViewport;
   const root = document.documentElement;
-  const h = vv ? Math.round(vv.height) : window.innerHeight;
-  if (window.innerHeight > baseH || baseH < 300) baseH = window.innerHeight;
-  const guarded = Date.now() - resumedAt < 1200;
-  // 键盘弹起判定：可视高度比基准矮一大截（iOS 里 innerHeight 和 vv.height 都可能变小）
-  const keyboardOpen = !guarded && (baseH - Math.min(window.innerHeight, h) > 120);
-  if (keyboardOpen) {
-    root.style.setProperty('--app-h', h + 'px');
-    root.style.setProperty('--vv-top', '0px');   // 只调高度，不再平移整页（平移会把输入框推出屏幕）
-  } else {
-    const closedH = (baseH > 300 ? baseH : window.innerHeight) || window.innerHeight;
-    root.style.setProperty('--app-h', Math.max(300, Math.round(closedH)) + 'px');
+  if (!vv) {
+    root.style.setProperty('--app-h', window.innerHeight + 'px');
     root.style.setProperty('--vv-top', '0px');
+    return;
   }
-  document.body.classList.toggle('kb-open', keyboardOpen);
-  scheduleClamp();
+  // iOS 键盘弹起时：可视区变小（height）且可能整体上移（offsetTop）。
+  // 两者必须同时跟，否则输入框和键盘之间会留一大条缝。
+  const h = Math.round(vv.height);
+  const top = Math.round(vv.offsetTop || 0);
+  root.style.setProperty('--app-h', Math.max(200, h) + 'px');
+  root.style.setProperty('--vv-top', top + 'px');
+  document.body.classList.toggle('kb-open', (window.innerHeight - h > 80) || top > 0);
   const elv = $('#ver');
   if (elv) elv.textContent = 'v' + BUILD;
   if (state.view === 'chat' && pinnedBottom) scrollBottom();
