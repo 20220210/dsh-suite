@@ -48,7 +48,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '162';   // 部署时由脚本替换成时间戳
+const BUILD = '163';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -910,6 +910,11 @@ function onFollowValue(v) {
       const ph = box.querySelector('.empty'); if (ph) ph.remove();
     }
     for (const r of v.records || []) renderRecord(r, box);
+    // 快照里最后一条如果是收尾事件，说明本会话已空闲（漏事件时靠这里兜底，避免一直显示运行中）
+    const recs = v.records || [];
+    const lastRec = recs[recs.length - 1];
+    const lastType = (lastRec && (lastRec.event ? lastRec.event.type : lastRec.type)) || '';
+    if (lastType === 'turn/end' || lastType === 'session/end-seed') setRunning(false);
     state.suppressScroll = false;
     if (firstLoad || wasPinned) scrollBottom(true);
     // 否则什么都不做：scrollTop 原样保留
@@ -2112,7 +2117,10 @@ function openEvents() {
     if (v.type === 'cancel') { state.pending.delete(v.eventId); renderPending(); return; }
     if (v.type === 'emit') {
       const [sid, running] = v.args || [];
-      if (v.event === 'api-session/status' && sid === state.sessionId && running === false) toast('这一轮跑完了', 2000);
+      if (v.event === 'api-session/status' && sid === state.sessionId && running === false) {
+        toast('这一轮跑完了', 2000);
+        loadSessions().catch(() => {});   // 列表里的“运行中”徽标尽快更新
+      }
       return;
     }
   };

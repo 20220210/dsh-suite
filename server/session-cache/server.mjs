@@ -570,7 +570,10 @@ function scanOnce({ quiet = false } = {}) {
       if (!it || !it.sessionId) continue;
       const e = next.get(it.sessionId);
       if (!e) continue;
-      if (runningSyncedAt.has(it.sessionId) && now - runningSyncedAt.get(it.sessionId) < 10 * 60 * 1000) continue;  // 有权威状态，别用 mtime 猜
+      // 只要 5 分钟内做过整体对账，就以 DSH 为准，不再用 mtime 猜——
+      // 否则回合刚结束（日志刚写）会被 90 秒规则重新标成“运行中”，要等下一轮对账才恢复
+      if (now - runningSyncAt < 5 * 60 * 1000) continue;
+      if (runningSyncedAt.has(it.sessionId) && now - runningSyncedAt.get(it.sessionId) < 10 * 60 * 1000) continue;
       const age = now - e.mtimeMs;
       const live = runningLive.get(it.sessionId);
       if (age < 90 * 1000) {
@@ -911,7 +914,7 @@ server.listen(PORT, '127.0.0.1', () => {
   // 自检：每 5 分钟一次，异常写日志（恢复也写）
   setTimeout(() => { try { healthCheck({ quiet: true }); } catch {} }, 5000);
   setInterval(() => { try { healthCheck(); } catch (e) { log('自检异常', String(e && e.message).slice(0, 120)); } }, 5 * 60 * 1000).unref?.();
-  setInterval(() => { syncRunningFromDSH('timer').catch(() => {}); }, 3 * 60 * 1000).unref?.();
+  setInterval(() => { syncRunningFromDSH('timer').catch(() => {}); }, 90 * 1000).unref?.();
   // 兜底：定期全量对账（只在距上次全量超过 FULL_MIN_MS 时）
   setInterval(() => {
     if (Date.now() - fullAt >= FULL_MIN_MS) scheduleFull('timer', 1000);
