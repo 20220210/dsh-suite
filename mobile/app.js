@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '156';   // 部署时由脚本替换成时间戳
+const BUILD = '157';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -1611,13 +1611,22 @@ function joinPath(parent, name) {
   return parent.replace(/\/+$/, '') + '/' + name;
 }
 
+/* 可在线预览的类型：文本 / 图片 / PDF */
+const TEXT_EXT = new Set(['txt','md','markdown','json','jsonl','js','mjs','cjs','ts','tsx','jsx','html','htm','css','scss','less','yml','yaml','toml','ini','conf','cfg','log','csv','tsv','xml','sh','bash','zsh','ps1','bat','py','go','rs','java','c','cpp','h','hpp','rb','php','sql','env','gitignore','dockerfile','makefile','lock','out','diff','patch']);
+const IMAGE_EXT = new Set(['png','jpg','jpeg','webp','gif','bmp','svg','ico']);
+const PREVIEW_TEXT_BYTES = 256 * 1024;
+const PREVIEW_IMAGE_BYTES = 20 * 1024 * 1024;
+const PREVIEW_PDF_BYTES = 30 * 1024 * 1024;
+function extOf(name) { const m = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/); return m ? m[1] : ''; }
+
 async function openFilesSheet() {
   if (!state.sessionId) return;
   fsPath = '.';
+  hideFilePreview();
   $('#filesheet').hidden = false;
   await loadFileList('.');
 }
-function closeFilesSheet() { $('#filesheet').hidden = true; }
+function closeFilesSheet() { hideFilePreview(); $('#filesheet').hidden = true; }
 
 async function loadFileList(path) {
   if (fsLoading) return;
@@ -1645,8 +1654,13 @@ async function loadFileList(path) {
       if (!isDir && typeof ent.size === 'number') row.append(el('span', 'sz', fmtFileSize(ent.size)));
       row.onclick = () => {
         if (isDir) { loadFileList(joinPath(path, ent.name)); return; }
-        if (ent.type !== 'file') { toast('这个条目不可下载', 2000); return; }
-        downloadWorkspaceFile(joinPath(path, ent.name), ent.name).catch((e) => toast('下载失败：' + e.message, 5000));
+        if (ent.type !== 'file') { toast('这个条目不支持预览/下载', 2000); return; }
+        const p = joinPath(path, ent.name), ext = extOf(ent.name);
+        if (TEXT_EXT.has(ext) || IMAGE_EXT.has(ext) || ext === 'pdf') {
+          previewWorkspaceFile(p, ent.name, ent.size).catch((e) => toast('预览失败：' + e.message, 5000));
+        } else {
+          downloadWorkspaceFile(p, ent.name).catch((e) => toast('下载失败：' + e.message, 5000));
+        }
       };
       box.append(row);
     }
@@ -1673,6 +1687,85 @@ async function readWorkspaceBytes(path, size) {
   const blob = new Blob(chunks);
   if (total > 0 && blob.size !== total) throw new Error('文件不完整（' + fmtFileSize(blob.size) + ' / ' + fmtFileSize(total) + '），已取消保存');
   return blob;
+}
+
+/* ---------- 在线预览 ---------- */
+let fsPreview = null;
+
+function hideFilePreview() {
+  const pv = $('#fs-preview');
+  if (pv) pv.hidden = true;
+  if (fsPreview && fsPreview.url) { try { URL.revokeObjectURL(fsPreview.url); } catch {} }
+  fsPreview = null;
+  const list = $('#fs-list'), pathEl = $('#fs-path');
+  if (list) list.hidden = false;
+  if (pathEl) pathEl.hidden = false;
+}
+
+async function readWorkspacePart(path, limit) {
+  const parts = [];
+  let offset = 0;
+  for (;;) {
+    const len = Math.min(FILE_CHUNK, Math.max(1, limit - offset));
+    const r = await rpcBinary('workspaceFiles/readBytes', {
+      workspaceFileScopeId: state.sessionId, path, options: { range: { offset, length: len } },
+    });
+    if (!r.blob || !r.blob.size) break;
+    parts.push(r.blob);
+    offset += r.blob.size;
+    if (r.value && r.value.eof === true) break;
+    if (offset >= limit) break;
+  }
+  return new Blob(parts);
+}
+
+async function previewWorkspaceFile(path, name, size) {
+  const ext = extOf(name);
+  const isImage = IMAGE_EXT.has(ext);
+  const isPdf = ext === 'pdf';
+  const limit = isImage ? PREVIEW_IMAGE_BYTES : isPdf ? PREVIEW_PDF_BYTES : PREVIEW_TEXT_BYTES;
+  const total = Number(size) || 0;
+  if (total && total > limit && !isImage && !isPdf) {
+    // 文本类：只读前 256KB，提示一下
+  }
+  const body = $('#fs-pbody'), pv = $('#fs-preview');
+  if (!body || !pv) return;
+  pv.hidden = false;
+  const list = $('#fs-list'), pathEl = $('#fs-path');
+  if (list) list.hidden = true;
+  if (pathEl) pathEl.hidden = true;
+  $('#fs-pname').textContent = name;
+  body.replaceChildren(el('div', 'fs-note', '加载中…'));
+  if (fsPreview && fsPreview.url) { try { URL.revokeObjectURL(fsPreview.url); } catch {} }
+  fsPreview = { path, name, size: total };
+  try {
+    const blob = await readWorkspacePart(path, Math.min(total || limit, limit));
+    if (isImage) {
+      const file = new File([blob], name, { type: FILE_MIME[ext] || 'image/*' });
+      const url = URL.createObjectURL(file); fsPreview.url = url;
+      const img = document.createElement('img'); img.src = url; img.alt = name;
+      body.replaceChildren(img);
+      return;
+    }
+    if (isPdf) {
+      const file = new File([blob], name, { type: 'application/pdf' });
+      const url = URL.createObjectURL(file); fsPreview.url = url;
+      const fr = document.createElement('iframe'); fr.src = url; fr.title = name;
+      body.replaceChildren(fr);
+      return;
+    }
+    const text = await blob.text();
+    const pre = document.createElement('pre');
+    pre.textContent = text.replace(/^\uFEFF/, '');
+    const frag = document.createDocumentFragment();
+    frag.append(pre);
+    if (total && blob.size >= limit && total > limit) {
+      frag.prepend(el('div', 'fs-note', '文件较大，仅预览前 ' + fmtFileSize(blob.size) + '（共 ' + fmtFileSize(total) + '），需要完整内容请点「下载」'));
+    }
+    body.replaceChildren(frag);
+  } catch (e) {
+    body.replaceChildren(el('div', 'fs-note', '预览失败：' + e.message));
+  }
 }
 
 async function downloadWorkspaceFile(path, name) {
@@ -2029,6 +2122,11 @@ $('#bell').onclick = () => togglePush().catch(() => {});
 const filesBtn = $('#files');
 if (filesBtn) filesBtn.onclick = () => openFilesSheet().catch((e) => toast('打开文件失败：' + e.message, 4000));
 const fsClose = $('#fs-close'); if (fsClose) fsClose.onclick = () => closeFilesSheet();
+const fsPBack = $('#fs-pback'); if (fsPBack) fsPBack.onclick = () => hideFilePreview();
+const fsPDown = $('#fs-pdownload'); if (fsPDown) fsPDown.onclick = () => {
+  if (!fsPreview) return;
+  downloadWorkspaceFile(fsPreview.path, fsPreview.name).catch((e) => toast('下载失败：' + e.message, 5000));
+};
 const fsMask = $('#filesheet')?.querySelector('.fs-mask'); if (fsMask) fsMask.onclick = () => closeFilesSheet();
 updateBell().catch(() => {});
 if ('serviceWorker' in navigator) {
