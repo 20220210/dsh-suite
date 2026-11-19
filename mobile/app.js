@@ -17,14 +17,16 @@ function wireInstanceSwitch() {
     btn.textContent = IS_RC2 ? 'rc2' : '主';
     btn.title = IS_RC2 ? '当前 rc.2 实例，点击切回主实例' : '当前主实例，点击切到 rc.2 实例';
     btn.onclick = () => {
+      // 目标实例直接写进 URL（?inst=），不依赖「导航前 localStorage 是否落盘」——
+      // iOS 上偶尔会丢掉这一拍，导致第一次点击看起来没生效、要点第二下。
       if (IS_RC2) {
-        localStorage.setItem('dshm.inst', 'main');
-        location.href = '/m/';
+        try { localStorage.setItem('dshm.inst', 'main'); } catch {}
+        location.replace('/m/?inst=main');
         return;
       }
-      localStorage.setItem('dshm.inst', 'rc2');
-      // 先让 nginx 用 dshm 换一个 rc.2 的 cookie，成功后回 /m/
-      location.href = '/m2/login?back=' + encodeURIComponent('/m/');
+      try { localStorage.setItem('dshm.inst', 'rc2'); } catch {}
+      // 先让 nginx 用 dshm 换 rc.2 的 cookie，然后直接落到 /m2/（路径本身就锁定 rc.2，最稳）
+      location.replace('/m2/login?back=' + encodeURIComponent('/m2/?inst=rc2'));
     };
   }
 }
@@ -46,7 +48,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '161';   // 部署时由脚本替换成时间戳
+const BUILD = '162';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -2417,6 +2419,8 @@ function showVersion() { const el0 = $('#ver'); if (el0) el0.textContent = 'v' +
 showVersion();
 
 (async function boot() {
+  // URL 规范化：rc.2 实例统一在 /m2/ 下运行（SW 作用域、cookie、API 前缀才一致）
+  if (IS_RC2 && !PATH_RC2) { location.replace('/m2/'); return; }
   $('#messages').replaceChildren();
   $('#gate-btn').onclick = () => {
     const inp = $('#gate-pass');
