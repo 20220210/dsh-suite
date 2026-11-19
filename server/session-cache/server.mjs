@@ -126,11 +126,16 @@ async function syncRunningFromDSH(reason) {
 function isRunningNow(it) {
   if (!it || !it.sessionId) return false;
   const sid = it.sessionId;
-  if (runningLive.get(sid) === true) {
-    if (runningSyncedAt.has(sid)) return true;
-    return Date.now() - (it.updatedAt || 0) < 20 * 60 * 1000;
+  if (runningLive.has(sid)) {
+    if (runningLive.get(sid) === true) {
+      if (runningSyncedAt.has(sid)) return true;
+      return Date.now() - (it.updatedAt || 0) < 20 * 60 * 1000;
+    }
+    return false;
   }
-  return false;
+  // 没有实时状态时（典型：rc.2 实例，列表每 5 秒直接向 3081 拉、本身就是最新的）：
+  // 直接信条目自己的 running 字段，不要压成 false
+  return it.running === true;
 }
 
 // ---------------------------------------------------------------- 运行状态事件流
