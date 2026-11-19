@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '157';   // 部署时由脚本替换成时间戳
+const BUILD = '159';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -1619,6 +1619,13 @@ const PREVIEW_IMAGE_BYTES = 20 * 1024 * 1024;
 const PREVIEW_PDF_BYTES = 30 * 1024 * 1024;
 function extOf(name) { const m = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/); return m ? m[1] : ''; }
 
+function workspaceRootPath() {
+  try {
+    const it = (state.sessions || []).find((x) => x.sessionId === state.sessionId);
+    return (it && (it.cwd || it.projections?.values?.workingDirectory)) || '';
+  } catch { return ''; }
+}
+
 async function openFilesSheet() {
   if (!state.sessionId) return;
   fsPath = '.';
@@ -1633,7 +1640,10 @@ async function loadFileList(path) {
   fsLoading = true;
   const box = $('#fs-list');
   box.replaceChildren(el('div', 'empty', '加载中…'));
-  $('#fs-path').textContent = path === '.' ? '工作区根目录' : path;
+  const root = workspaceRootPath();
+  const titleEl = $('#fs-title');
+  if (titleEl) titleEl.textContent = root ? ('文件 · ' + root) : '文件';
+  $('#fs-path').textContent = path === '.' ? (root ? ('工作区根目录 · ' + root) : '工作区根目录') : (root ? root.replace(/\/+$/, '') + '/' + path : path);
   try {
     const v = await rpc('workspaceFiles/list', { workspaceFileScopeId: state.sessionId, path });
     const entries = (v && v.entries) || [];
@@ -1646,6 +1656,8 @@ async function loadFileList(path) {
       box.append(up);
     }
     if (!entries.length) { box.append(el('div', 'empty', '空目录')); return; }
+    if (v && v.truncated) box.append(el('div', 'fs-note', '目录条目过多，这里只显示了一部分'));
+    if (path === '.') box.append(el('div', 'fs-note', '点文件夹进入 · 点文件预览/下载 · 这里是本会话的工作目录，不是整台服务器'));
     entries.sort((a, b) => (b.type === 'directory') - (a.type === 'directory') || String(a.name).localeCompare(String(b.name)));
     for (const ent of entries) {
       const row = el('div', 'fs-row');
