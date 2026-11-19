@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '160';   // 部署时由脚本替换成时间戳
+const BUILD = '161';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -1735,6 +1735,7 @@ function hideFilePreview() {
   const list = $('#fs-list'), pathEl = $('#fs-path');
   if (list) list.hidden = false;
   if (pathEl) pathEl.hidden = false;
+  const toggle = $('#fs-pview'); if (toggle) toggle.hidden = true;
 }
 
 async function readWorkspacePart(path, limit) {
@@ -1752,6 +1753,30 @@ async function readWorkspacePart(path, limit) {
     if (offset >= limit) break;
   }
   return new Blob(parts);
+}
+
+/** 纯文本预览：<pre> 原样显示 */
+function renderPlainTextPreview(text, total, shownBytes, limit) {
+  const body = $('#fs-pbody'); if (!body) return;
+  const pre = document.createElement('pre');
+  pre.textContent = text;
+  const frag = document.createDocumentFragment();
+  frag.append(pre);
+  if (total && shownBytes >= limit && total > limit) {
+    frag.prepend(el('div', 'fs-note', '文件较大，仅预览前 ' + fmtFileSize(shownBytes) + '（共 ' + fmtFileSize(total) + '），需要完整内容请点「下载」'));
+  }
+  body.replaceChildren(frag);
+}
+
+/** HTML 预览：用 sandbox iframe 渲染（脚本可跑、但不能碰本页 cookie/DOM） */
+function renderHtmlPreview(text, name) {
+  const body = $('#fs-pbody'); if (!body) return;
+  const fr = document.createElement('iframe');
+  fr.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals');
+  fr.setAttribute('referrerpolicy', 'no-referrer');
+  fr.title = name || 'html preview';
+  fr.srcdoc = text;
+  body.replaceChildren(fr);
 }
 
 async function previewWorkspaceFile(path, name, size) {
@@ -1772,7 +1797,7 @@ async function previewWorkspaceFile(path, name, size) {
   $('#fs-pname').textContent = name;
   body.replaceChildren(el('div', 'fs-note', '加载中…'));
   if (fsPreview && fsPreview.url) { try { URL.revokeObjectURL(fsPreview.url); } catch {} }
-  fsPreview = { path, name, size: total };
+  fsPreview = { path, name, size: total, html: (ext === 'html' || ext === 'htm'), view: 'render' };
   try {
     const blob = await readWorkspacePart(path, Math.min(total || limit, limit));
     if (isImage) {
@@ -1789,15 +1814,16 @@ async function previewWorkspaceFile(path, name, size) {
       body.replaceChildren(fr);
       return;
     }
-    const text = await blob.text();
-    const pre = document.createElement('pre');
-    pre.textContent = text.replace(/^\uFEFF/, '');
-    const frag = document.createDocumentFragment();
-    frag.append(pre);
-    if (total && blob.size >= limit && total > limit) {
-      frag.prepend(el('div', 'fs-note', '文件较大，仅预览前 ' + fmtFileSize(blob.size) + '（共 ' + fmtFileSize(total) + '），需要完整内容请点「下载」'));
+    const text = (await blob.text()).replace(/^\uFEFF/, '');
+    fsPreview.text = text;
+    if (fsPreview.html) { renderHtmlPreview(text, name); }
+    else { renderPlainTextPreview(text, total, blob.size, limit); }
+    // HTML 文件显示「源码/渲染」切换
+    const toggle = $('#fs-pview');
+    if (toggle) {
+      toggle.hidden = !fsPreview.html;
+      toggle.textContent = fsPreview.view === 'render' ? '源码' : '渲染';
     }
-    body.replaceChildren(frag);
   } catch (e) {
     body.replaceChildren(el('div', 'fs-note', '预览失败：' + e.message));
   }
@@ -2158,6 +2184,13 @@ const filesBtn = $('#files');
 if (filesBtn) filesBtn.onclick = () => openFilesSheet().catch((e) => toast('打开文件失败：' + e.message, 4000));
 const fsClose = $('#fs-close'); if (fsClose) fsClose.onclick = () => closeFilesSheet();
 const fsPBack = $('#fs-pback'); if (fsPBack) fsPBack.onclick = () => hideFilePreview();
+const fsPView = $('#fs-pview'); if (fsPView) fsPView.onclick = () => {
+  if (!fsPreview || !fsPreview.html || typeof fsPreview.text !== 'string') return;
+  fsPreview.view = fsPreview.view === 'render' ? 'source' : 'render';
+  fsPView.textContent = fsPreview.view === 'render' ? '源码' : '渲染';
+  if (fsPreview.view === 'render') renderHtmlPreview(fsPreview.text, fsPreview.name);
+  else renderPlainTextPreview(fsPreview.text, fsPreview.size, fsPreview.size, fsPreview.size);
+};
 const fsPDown = $('#fs-pdownload'); if (fsPDown) fsPDown.onclick = () => {
   if (!fsPreview) return;
   downloadWorkspaceFile(fsPreview.path, fsPreview.name).catch((e) => toast('下载失败：' + e.message, 5000));

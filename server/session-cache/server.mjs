@@ -65,6 +65,11 @@ const istats = {
 
 // 会话实时运行状态：sid -> bool（事件流比缓存新，返回缓存时用它覆盖）
 const runningLive = new Map();
+// 最近一次“DSH 权威对账”确认过 running 的会话：sid -> 对账时间
+// 有它就完全信 DSH，不再用日志 mtime 猜（mtime 猜法正是长期误报“运行中”的根源）
+const runningSyncedAt = new Map();
+let runningSyncAt = 0;
+let runningSyncInflight = null;
 // 自检用：事件流是否连着 / 连过几次 / 失败几次
 let eventWatchUp = false;
 let eventWatchConnects = 0;
@@ -76,6 +81,56 @@ function json(res, code, obj, extraHeaders = {}) {
   const buf = Buffer.from(JSON.stringify(obj));
   res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length, ...extraHeaders });
   res.end(buf);
+}
+
+// ---------------------------------------------------------------- running 权威对账
+
+/** 拉一次 DSH session/list，用它的 running 字段覆盖本地 runningLive（事件流漏事件时兜底） */
+async function syncRunningFromDSH(reason) {
+  if (runningSyncInflight) return runningSyncInflight;
+  if (Date.now() - runningSyncAt < 30000) return null;
+  runningSyncInflight = (async () => {
+    const started = Date.now();
+    try {
+      const body = JSON.stringify({ type: 'client-request', rpcId: 'rsync', method: 'session/list', payload: { args: { _request: {} } } });
+      const text = await fetchLive(body);
+      const obj = JSON.parse(text);
+      const items = itemsOf(obj) || [];
+      if (!items.length) throw new Error('对账列表为空');
+      const now = Date.now();
+      let changed = 0;
+      for (const it of items) {
+        const sid = it && it.sessionId;
+        if (!sid) continue;
+        const next = it.running === true;
+        const prev = runningLive.get(sid);
+        runningLive.set(sid, next);
+        if (next) runningSyncedAt.set(sid, now); else runningSyncedAt.delete(sid);
+        if (prev !== next) changed += 1;
+      }
+      runningSyncAt = now;
+      if (changed) log(`running 对账（${reason}）：${changed} 个会话状态修正，用时 ${((Date.now() - started) / 1000).toFixed(1)}s`);
+      return changed;
+    } catch (e) {
+      if (String(e && e.message).includes('401') || String(e && e.message).includes('403')) cookie = null;
+      log('running 对账失败（' + reason + '）：' + String(e && e.message).slice(0, 100));
+      return null;
+    } finally {
+      runningSyncInflight = null;
+    }
+  })();
+  return runningSyncInflight;
+}
+
+/** 展示用：running 以 DSH 对账结果为准；没有对账结果时退回“最近 20 分钟有日志写入”的旧兜底 */
+function isRunningNow(it) {
+  if (!it || !it.sessionId) return false;
+  const sid = it.sessionId;
+  if (runningLive.get(sid) === true) {
+    if (runningSyncedAt.has(sid)) return true;
+    return Date.now() - (it.updatedAt || 0) < 20 * 60 * 1000;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------- 运行状态事件流
@@ -97,6 +152,7 @@ function startEventWatch() {
       eventWatchConnects += 1;
       ws.send(JSON.stringify({ type: 'open', streamId: 'cache-ev', endpoint: '$events', payload: { args: {} } }));
       log('事件监听已连接（用于实时 running 状态）');
+      setTimeout(() => { syncRunningFromDSH('event-open').catch(() => {}); }, 800);
     });
     ws.on('message', (raw) => {
       let f; try { f = JSON.parse(raw.toString()); } catch { return; }
@@ -509,6 +565,7 @@ function scanOnce({ quiet = false } = {}) {
       if (!it || !it.sessionId) continue;
       const e = next.get(it.sessionId);
       if (!e) continue;
+      if (runningSyncedAt.has(it.sessionId) && now - runningSyncedAt.get(it.sessionId) < 10 * 60 * 1000) continue;  // 有权威状态，别用 mtime 猜
       const age = now - e.mtimeMs;
       const live = runningLive.get(it.sessionId);
       if (age < 90 * 1000) {
@@ -628,7 +685,7 @@ function slimItems(items) {
     const ss = v.sessionStats || {};
     return {
       sessionId: it.sessionId,
-      running: it.running === true && Date.now() - (it.updatedAt || 0) < 20 * 60 * 1000,
+      running: isRunningNow(it),
       updatedAt: it.updatedAt || 0,
       cwd: it.cwd || '',
       blank: it.blank === true,
@@ -719,7 +776,7 @@ const server = http.createServer(async (req, res) => {
         const ss = v.sessionStats || {};
         return {
           sessionId: it.sessionId,
-          running: it.running === true && Date.now() - (it.updatedAt || 0) < 20 * 60 * 1000,
+          running: isRunningNow(it),
           updatedAt: it.updatedAt || 0,
           cwd: it.cwd || '',
           blank: it.blank === true,
@@ -849,6 +906,7 @@ server.listen(PORT, '127.0.0.1', () => {
   // 自检：每 5 分钟一次，异常写日志（恢复也写）
   setTimeout(() => { try { healthCheck({ quiet: true }); } catch {} }, 5000);
   setInterval(() => { try { healthCheck(); } catch (e) { log('自检异常', String(e && e.message).slice(0, 120)); } }, 5 * 60 * 1000).unref?.();
+  setInterval(() => { syncRunningFromDSH('timer').catch(() => {}); }, 3 * 60 * 1000).unref?.();
   // 兜底：定期全量对账（只在距上次全量超过 FULL_MIN_MS 时）
   setInterval(() => {
     if (Date.now() - fullAt >= FULL_MIN_MS) scheduleFull('timer', 1000);
