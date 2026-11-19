@@ -48,7 +48,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '163';   // 部署时由脚本替换成时间戳
+const BUILD = '164';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -1448,7 +1448,7 @@ function renderGoal() {
     const p = el('button', null, '暂停');
     p.onclick = (e) => { e.stopPropagation(); goalAction('pause'); };
     quick.append(p);
-  } else if (g.phase === 'paused') {
+  } else if (g.phase === 'paused' || g.phase === 'blocked') {
     const r = el('button', null, '继续');
     r.onclick = (e) => { e.stopPropagation(); goalAction('resume'); };
     quick.append(r);
@@ -1516,6 +1516,12 @@ function openGoalSheet(editMode) {
       const c = el('button', 'primary', '标记完成'); c.onclick = () => goalAction('complete'); btns.append(c);
     } else if (g.phase === 'paused') {
       const r = el('button', 'primary', '继续'); r.onclick = () => goalAction('resume'); btns.append(r);
+    } else if (g.phase === 'blocked') {
+      // 受阻的目标：DSH 允许从 blocked 直接 resume（预算未用完时）
+      const r = el('button', 'primary', '继续'); r.onclick = () => goalAction('resume'); btns.append(r);
+      const c = el('button', null, '标记完成'); c.onclick = () => goalAction('complete'); btns.append(c);
+      const cl = el('button', null, '清除目标'); cl.onclick = () => goalAction('clear'); btns.append(cl);
+      body.append(el('div', 'ghint', '受阻：点「继续」会从当前轮次接着跑；如果提示轮次已用完，需要新建目标。'));
     } else if (g.phase === 'complete') {
       const cl = el('button', null, '清除目标'); cl.onclick = () => goalAction('clear'); btns.append(cl);
     }
