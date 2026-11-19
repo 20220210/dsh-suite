@@ -46,7 +46,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '159';   // 部署时由脚本替换成时间戳
+const BUILD = '160';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -58,6 +58,24 @@ const nowTZ = () => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
 const pendingDeepLink = new URLSearchParams(location.search).get('session');
 const state = { listScroll: 0, touching: false, listSig: '', workspaces: [], expandedGroups: new Set(), pinned: new Set(), archived: new Set(), view: 'list', sessions: [], sessionId: null, clientId: null, pending: new Map(), ws: null, followWs: null, live: null, running: false, mode: 'steer', images: [], files: [], toolCount: 0, toolRow: null, shownRpc: new Set(), queue: [], thinkRow: null, thinkPhase: 'thinking', toolLabel: '', catalog: null, model: null, stats: null, turnStart: null, turnSteps: 0, ticker: null, followRetry: 0, wsRetry: 0, connState: 'ok' };
+
+async function copyToClipboard(text) {
+  try { await navigator.clipboard.writeText(String(text)); return true; } catch {}
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = String(text);
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-1000px';
+    ta.style.opacity = '0';
+    document.body.append(ta);
+    ta.select();
+    ta.setSelectionRange(0, String(text).length);
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch { return false; }
+}
 
 function toast(msg, ms = 2600) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
@@ -1367,6 +1385,11 @@ function openRowMenu(it) {
     row2.append(inp, save);
     list.append(row2);
     setTimeout(() => inp.focus(), 100);
+  }));
+
+  list.append(mk('🆔', '复制会话 ID', async () => {
+    const ok = await copyToClipboard(it.sessionId);
+    toast(ok ? '已复制会话 ID' : ('复制失败，ID：' + it.sessionId), ok ? 1600 : 4000);
   }));
 
   list.append(mk('🗄', '归档会话', async () => {
