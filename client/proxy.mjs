@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.5.7';
+const VERSION = '1.5.8';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
@@ -147,24 +147,65 @@ for (const d of [CACHE_DIR, API_DIR, STATIC_DIR]) fs.mkdirSync(d, { recursive: t
 // ---------------------------------------------------------------- 日志 / 统计
 
 let logStream = null;
+let logBytes = 0;
+let logToConsole = process.env.DSH_CLIENT_QUIET !== '1';
+const LOG_MAX_BYTES = 10 * 1024 * 1024;   // 单文件上限 10MB
+const LOG_LINE_MAX = 4000;                // 单行上限，防止异常堆栈把日志撑爆
+
+function rotateLogIfNeeded() {
+  if (logBytes < LOG_MAX_BYTES) return;
+  try { logStream?.end(); } catch {}
+  try { fs.rmSync(LOG_FILE + '.1', { force: true }); } catch {}
+  try { fs.renameSync(LOG_FILE, LOG_FILE + '.1'); } catch {}
+  try { logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' }); logBytes = 0; } catch { logStream = null; }
+}
+
 try {
-  // 简单轮转：超过 10MB 就转成 .1（只保留一份），避免长期运行后日志无限涨
+  // 启动时也轮转一次（历史遗留的超大文件）
   try {
     const st = fs.statSync(LOG_FILE);
-    if (st.size > 10 * 1024 * 1024) {
+    if (st.size > LOG_MAX_BYTES) {
       try { fs.rmSync(LOG_FILE + '.1', { force: true }); } catch {}
       try { fs.renameSync(LOG_FILE, LOG_FILE + '.1'); } catch {}
     }
   } catch {}
   logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
 } catch {}
+
+let lastLogMsg = '';
+let lastLogAt = 0;
+let dupSilenced = 0;
 function log(...args) {
-  const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
-  console.log(line);
+  let text;
+  try { text = args.join(' '); } catch { text = '<unstringifiable>'; }
+  // 相同消息 5 秒内只写一次（防重连风暴刷屏）
+  const now = Date.now();
+  if (text === lastLogMsg && now - lastLogAt < 5000) {
+    dupSilenced += 1;
+    return;
+  }
+  if (dupSilenced > 0) {
+    const n = dupSilenced; dupSilenced = 0;
+    try { logStream?.write(`[${new Date().toISOString()}] ... 上一行重复 ${n} 次\n`); } catch {}
+  }
+  lastLogMsg = text; lastLogAt = now;
+  let line = `[${new Date().toISOString()}] ${text}`;
+  if (line.length > LOG_LINE_MAX) line = line.slice(0, LOG_LINE_MAX) + ' …(截断)';
+  if (logToConsole) {
+    try { console.log(line); } catch { logToConsole = false; }   // 控制台写不进去就永久闭嘴，绝不递归
+  }
   try {
-    logStream?.write(line + '\n');
-  } catch {}
+    if (logStream) {
+      logStream.write(line + '\n');
+      logBytes += Buffer.byteLength(line) + 1;
+      rotateLogIfNeeded();
+    }
+  } catch { logToConsole = false; }
 }
+
+// stdout/stderr 被父进程关掉时（EPIPE）安静吞掉，不要冒泡成未捕获异常
+try { process.stdout.on('error', () => { logToConsole = false; }); } catch {}
+try { process.stderr.on('error', () => { logToConsole = false; }); } catch {}
 
 const stats = {
   version: VERSION,
@@ -322,6 +363,8 @@ function rawRequest({ method = 'GET', path: reqPath, headers = {}, body = null, 
 }
 
 let loginInFlight = null;
+let authFailStreak = 0;
+let authCooldownUntil = 0;
 function ensureLogin() {
   if (!loginInFlight) {
     loginInFlight = login().finally(() => {
@@ -357,6 +400,11 @@ async function requestUpstreamOnce(options) {
   const first = await rawRequest(options);
   const status = first.res.statusCode;
   if ((status === 401 || status === 403) && !options._retried) {
+    const now = Date.now();
+    if (authCooldownUntil > now) {   // 冷却中：直接把 401 回给调用方，不再重登
+      try { for await (const _ of first.res) { /* drain */ } } catch {}
+      return first;
+    }
     try {
       for await (const _ of first.res) {
         /* 丢弃旧响应体，释放连接 */
@@ -371,9 +419,16 @@ async function requestUpstreamOnce(options) {
     const retry = await rawRequest({ ...options, _retried: true });
     if (!ok || retry.res.statusCode === 401 || retry.res.statusCode === 403) {
       stats.authError = true;
-      log('登录凭据可能已失效（401/403）：请更新 config.json 里的 token（帮助 → 更新访问令牌）');
+      authFailStreak += 1;
+      if (authFailStreak >= 3) {
+        authCooldownUntil = now + 5 * 60 * 1000;   // 连续失败 3 次 → 冷却 5 分钟
+        log(`登录凭据失效（连续 ${authFailStreak} 次 401/403），暂停自动重登 5 分钟；请用「帮助 → 更新访问令牌」更新后再试`);
+      } else {
+        log('登录凭据可能已失效（401/403）：请更新 config.json 里的 token（帮助 → 更新访问令牌）');
+      }
     } else {
       stats.authError = false;
+      authFailStreak = 0;
       log('重新登录成功，请求已重试');
     }
     return retry;
@@ -1568,7 +1623,16 @@ async function main() {
   });
 }
 
-process.on('uncaughtException', (error) => log('未捕获异常:', String(error?.stack ?? error)));
-process.on('unhandledRejection', (error) => log('未处理 Promise:', String(error?.stack ?? error)));
+process.on('uncaughtException', (error) => {
+  // EPIPE/ECONNRESET 这类管道错误属于正常断连，直接忽略，绝不进入“日志失败→记异常→再写日志”的循环
+  const code = String((error && error.code) || '');
+  if (/EPIPE|ECONNRESET|ERR_STREAM_DESTROYED|ERR_STREAM_WRITE_AFTER_END/.test(code)) return;
+  try { log('未捕获异常:', String((error && error.stack) || error).slice(0, 3000)); } catch {}
+});
+process.on('unhandledRejection', (error) => {
+  const code = String((error && error.code) || '');
+  if (/EPIPE|ECONNRESET|ERR_STREAM_DESTROYED|ERR_STREAM_WRITE_AFTER_END/.test(code)) return;
+  try { log('未处理 Promise:', String((error && error.stack) || error).slice(0, 3000)); } catch {}
+});
 
 main();

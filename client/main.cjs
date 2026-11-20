@@ -80,9 +80,20 @@ function logFile() {
   return path.join(dir, 'proxy.log');
 }
 
-function mainLog(...args) {
+function rotateLog(pathname, maxBytes = 10 * 1024 * 1024) {
   try {
-    fs.appendFileSync(logFile(), `[${new Date().toISOString()}] [main] ${args.join(' ')}\n`);
+    const st = fs.statSync(pathname);
+    if (st.size <= maxBytes) return;
+    try { fs.rmSync(pathname + '.1', { force: true }); } catch {}
+    try { fs.renameSync(pathname, pathname + '.1'); } catch {}
+  } catch {}
+}
+
+function mainLog(...args) {
+  const file = logFile();
+  rotateLog(file);
+  try {
+    fs.appendFileSync(file, `[${new Date().toISOString()}] [main] ${args.join(' ')}\n`);
   } catch {}
 }
 
@@ -455,7 +466,6 @@ function portOpen(port, timeoutMs = 1500) {
 
 function startProxy(cfgPath, idx = 0) {
   const proxyScript = path.join(__dirname, 'proxy.mjs');
-  const out = fs.createWriteStream(logFile(), { flags: 'a' });
   const runtime = runtimeConfig();
   const it = inst(idx);
   const secrets = { basicUser: runtime.basicUser ?? '', basicPass: runtime.basicPass ?? '', token: runtime.token ?? '' };
@@ -466,6 +476,8 @@ function startProxy(cfgPath, idx = 0) {
     DSH_CLIENT_UPSTREAM: it.upstream,
     DSH_CLIENT_PORT: String(it.port),
     DSH_CLIENT_NAME: `${String(CLIENT_NAME || 'dsh-client').replace(/[^\x20-\x7E]/g, '')}-i${idx}`.replace(/\s+/g, '-'),
+    // 代理日志由它自己写并轮转；不要再用 stdout 回写，避免父进程关闭管道引发 EPIPE 连坏
+    DSH_CLIENT_QUIET: '1',
   };
   if (key) extraEnv.DSH_CLIENT_KEY = key;
   const child = spawn(process.execPath, [proxyScript, '--no-open'], {
@@ -474,21 +486,18 @@ function startProxy(cfgPath, idx = 0) {
       ELECTRON_RUN_AS_NODE: '1', // 用 Electron 内置 Node 跑 ESM 脚本，用户无需装 Node
       ...extraEnv,
     },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'ignore', 'ignore'],
     windowsHide: true,
   });
   proxyChildren.set(it.port, child);
-  // end:false —— 不要把日志流结束掉，否则子进程退出后再写会抛 ERR_STREAM_WRITE_AFTER_END
-  child.stdout.pipe(out, { end: false });
-  child.stderr.pipe(out, { end: false });
-  const logLine = (text) => { try { if (!out.writableEnded) out.write(text); } catch {} };
+  const logLine = (text) => { try { mainLog(text); } catch {} };
   child.on('exit', (code) => {
-    logLine(`\n[main] 代理退出 code=${code} (${it.name} :${it.port})\n`);
+    logLine(`代理退出 code=${code} (${it.name} :${it.port})`);
   });
   child.on('error', (error) => {
-    logLine(`\n[main] 代理启动失败 (${it.name}): ${error}\n`);
+    logLine(`代理启动失败 (${it.name}): ${error}`);
   });
-  child.on('close', () => { proxyChildren.delete(it.port); try { out.end(); } catch {} });
+  child.on('close', () => { proxyChildren.delete(it.port); });
 }
 
 function stopProxy(idx = currentInst) {
@@ -1397,6 +1406,14 @@ if (!gotLock) {
     }
 
     buildMenu();
+    // 老版本可能留下超大 proxy.log（日志炸弹），启动时兜底轮转，避免再次占满磁盘
+    try {
+      const cacheBase = path.join(process.env.LOCALAPPDATA || userDataDir(), 'dsh-client');
+      for (const name of fs.readdirSync(cacheBase)) {
+        if (!name.startsWith('cache')) continue;
+        rotateLog(path.join(cacheBase, name, 'proxy.log'));
+      }
+    } catch {}
     ensureRemoteTicker();
     cleanupUpdaterDirs();
     try {
