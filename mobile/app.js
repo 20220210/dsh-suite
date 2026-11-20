@@ -48,7 +48,7 @@ function showFatal(msg) {
 window.addEventListener('error', (e) => showFatal(e.message || String(e.error || 'unknown')));
 window.addEventListener('unhandledrejection', (e) => showFatal((e.reason && (e.reason.message || e.reason)) || 'promise rejected'));
 
-const BUILD = '164';   // 部署时由脚本替换成时间戳
+const BUILD = '166';   // 部署时由脚本替换成时间戳
 /* DSH 移动端 PWA —— 会话列表 / 对话流 / 发消息 / 双向审批
  * 协议：POST /api/<method> {type:'client-request',rpcId,method,payload:{args}}
  *       WS  /api/remote.mux  {type:'open',streamId,endpoint,payload:{args}} */
@@ -241,7 +241,8 @@ function paintSessionList(items, fromCache) {
     '|' + (it.projections?.values?.title || '') + '|' + (it.projections?.values?.sessionStats?.turns || 0)).join(',')
     + '#' + fromCache
     + '#' + Array.from(state.expandedGroups || []).sort().join('|')
-    + '#' + Array.from(state.pinned || []).sort().join('|');
+    + '#' + Array.from(state.pinned || []).sort().join('|')
+    + '#' + (state.showChildren ? 1 : 0) + '#' + ((state.allSessions || []).filter((x) => x.isChild).length);
   if (sig === state.listSig) return;
   // 手指正在屏幕上：等松手后再重建
   if (state.touching) { state.pendingListPaint = () => paintSessionList(items, fromCache); return; }
@@ -300,6 +301,22 @@ function paintSessionList(items, fromCache) {
     }
   }
   if (keepTop > 0) { box.scrollTop = keepTop; state.listScroll = keepTop; }
+
+  // 子会话开关（子任务/子代理会话）
+  try {
+    const kids = (state.allSessions || []).filter((x) => x.isChild);
+    if (kids.length) {
+      const foot = el('div', 'list-foot');
+      const btn = el('button', 'child-toggle', (state.showChildren ? '隐藏' : '显示') + '子会话（' + kids.length + '）');
+      btn.onclick = () => {
+        state.showChildren = !state.showChildren;
+        try { localStorage.setItem('dshm.showChildren', state.showChildren ? '1' : '0'); } catch {}
+        loadSessions().catch(() => {});
+      };
+      foot.append(btn);
+      box.append(foot);
+    }
+  } catch {}
 }
 
 // 轻量列表（服务器侧裁剪，87KB 而不是 1.95MB，iPhone 解析不卡）
@@ -348,9 +365,13 @@ async function loadSessions() {
   } finally {
     clearTimeout(slowTimer);
   }
-  const items = (value?.items || [])
+  const raw = (value?.items || [])
     .filter((it) => !state.archived.has(it.sessionId))
-    .filter((it) => it.blank !== true)
+    .filter((it) => it.blank !== true);
+  state.allSessions = raw;
+  state.showChildren = localStorage.getItem('dshm.showChildren') === '1';
+  // 子任务/子代理会话默认隐藏（和电脑端一致）；用户点“显示子会话”才出现
+  const items = (state.showChildren ? raw : raw.filter((it) => it.isChild !== true))
     .slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   state.sessions = items;
   state.sessionsLoaded = true;

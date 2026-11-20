@@ -697,6 +697,7 @@ function slimItems(items) {
       updatedAt: it.updatedAt || 0,
       cwd: it.cwd || '',
       blank: it.blank === true,
+      isChild: !!(it.parentSessionId || v.subagent),
       project: {
         title: v.title || '',
         turns: ss.turns || 0,
@@ -788,6 +789,7 @@ const server = http.createServer(async (req, res) => {
           updatedAt: it.updatedAt || 0,
           cwd: it.cwd || '',
           blank: it.blank === true,
+          isChild: !!(it.parentSessionId || v.subagent),
           project: {
             title: v.title || '',
             turns: ss.turns || 0,
