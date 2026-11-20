@@ -7,7 +7,7 @@ Type=simple
 WorkingDirectory=/opt/dsh/rc2-host
 Environment=DSH_HOME=/opt/dsh/.dsh-rc2
 Environment=DSH_BASE=/opt/dsh/rc2-host/node_modules/@deepseek-ai
-ExecStart=/opt/node/bin/node node_modules/.bin/dsh --profile web --host 127.0.0.1 --port 3081 --no-open --trusted-host 127.0.0.1:3081 --trusted-host localhost:3081 --trusted-host 192.168.1.210:3081
+ExecStart=/opt/dsh/.nvm/versions/node/v22.23.2/bin/node node_modules/.bin/dsh --profile web --host 127.0.0.1 --port 3081 --no-open --trusted-host 127.0.0.1:3081 --trusted-host localhost:3081 --trusted-host 192.168.1.210:3081
 StandardOutput=append:/opt/dsh/dsh-web-rc2.log
 StandardError=append:/opt/dsh/dsh-web-rc2.log
 Restart=always
