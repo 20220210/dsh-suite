@@ -146,6 +146,16 @@ function applyPendingUpdate(options) {
   try {
     fs.rmSync(pending.zipPath, { force: true });
   } catch {}
+  // macOS：更新会改动 App 包内文件、破坏本机临时签名，这里自动重签一次，
+  // 避免下次启动又被系统报“已损坏”（没有 codesign 的机器上静默失败即可）
+  if (process.platform === 'darwin') {
+    try {
+      const { spawnSync } = require('node:child_process');
+      const bundle = path.resolve(appPath, '..', '..', '..');
+      const r = spawnSync('codesign', ['--force', '--deep', '--sign', '-', bundle], { encoding: 'utf8' });
+      log(r.status === 0 ? 'macOS 重签完成' : ('macOS 重签失败：' + String((r.stderr || r.error || '')).slice(0, 200)));
+    } catch (e) { log('macOS 重签异常：' + String(e && e.message)); }
+  }
   log('更新应用完成，准备重启');
   return { applied: true, version: pending.version };
 }

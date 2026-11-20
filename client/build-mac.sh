@@ -72,17 +72,49 @@ cp -r "$APP/assets" "$RES/app/"
 cat > "$WORK/使用说明-mac.txt" <<'EOF'
 DSH Desktop（macOS 未签名版）
 1) 把 DSH Desktop.app 拖到「应用程序」文件夹
-2) 首次打开：右键点图标 → 打开 → 再点「打开」（未签名，系统会拦一次）
-   或者终端执行：xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"
-3) 需要 macOS 13 或更高版本；首次运行会弹密码框，输入 DSH 访问密码
-4) 开机自启 / 自动更新 在菜单栏托盘图标里
+2) 双击同目录里的「修复签名.command」，输入 Mac 登录密码（本机临时签名，只需一次）
+   手动等效命令：
+     sudo xattr -dr com.apple.quarantine "/Applications/DSH Desktop.app"
+     sudo codesign --force --deep --sign - "/Applications/DSH Desktop.app"
+3) 双击打开 App；若提示“无法验证开发者”，去 系统设置 → 隐私与安全性 → 点“仍要打开”
+4) 需要 macOS 13 或更高版本；首次运行会弹密码框，输入 DSH 访问密码
+5) 开机自启 / 自动更新 在菜单栏托盘图标里
+说明：macOS 会对改过 Info.plist 的未签名应用报“已损坏”，第 2 步就是解除这个误报。
 EOF
-cp "$WORK/使用说明-mac.txt" "$APPB/使用说明-mac.txt" 2>/dev/null || true
+# 使用说明放进 Contents/Resources（可被签名封装），不要放在 .app 根目录（会导致 codesign 报 unsealed contents）
+mkdir -p "$APPB/Contents/Resources"
+cp "$WORK/使用说明-mac.txt" "$APPB/Contents/Resources/使用说明-mac.txt"
+
+cat > "$WORK/修复签名.command" <<'CMD'
+#!/bin/bash
+# DSH Desktop 本机临时签名（未签名包在 Apple Silicon 上会被报“已损坏”）
+APP="/Applications/DSH Desktop.app"
+if [ ! -d "$APP" ]; then
+  APP="$(cd "$(dirname "$0")" && pwd)/DSH Desktop.app"
+fi
+if [ ! -d "$APP" ]; then
+  echo "没找到 DSH Desktop.app，请把 App 拖到「应用程序」后再运行本脚本。"
+  read -n 1 -s -r -p "按任意键关闭…"
+  exit 1
+fi
+echo "处理：$APP"
+sudo xattr -dr com.apple.quarantine "$APP"
+sudo codesign --force --deep --sign - "$APP"
+echo
+echo "完成！现在可以双击「DSH Desktop」打开了。"
+echo "（如果提示“无法验证开发者”，去 系统设置 → 隐私与安全性 → 点“仍要打开”）"
+read -n 1 -s -r -p "按任意键关闭…"
+CMD
+chmod +x "$WORK/修复签名.command"
+
+# 打包前检查：.app 根目录只允许 Contents（否则 codesign 会失败）
+EXTRA=$(ls -A "$APPB" | grep -v '^Contents$' || true)
+if [ -n "$EXTRA" ]; then echo "错误：.app 根目录有额外文件，会导致签名失败：$EXTRA" >&2; exit 1; fi
 
 echo "== 6) 打包 =="
 cd "$WORK"
 rm -f "$OUT/dsh-desktop-v$VERSION-mac-$ARCH.zip"
-zip -qry "$OUT/dsh-desktop-v$VERSION-mac-$ARCH.zip" "DSH Desktop.app" "使用说明-mac.txt"
+zip -qry "$OUT/dsh-desktop-v$VERSION-mac-$ARCH.zip" "DSH Desktop.app" "使用说明-mac.txt" "修复签名.command"
 cd "$RES/app"
 rm -f "$OUT/app-$VERSION-mac-$ARCH.zip"
 zip -qr "$OUT/app-$VERSION-mac-$ARCH.zip" .
