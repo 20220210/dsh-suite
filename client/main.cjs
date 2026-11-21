@@ -1,7 +1,7 @@
 // DSH 桌面版 v1.2.0 —— Electron 主进程（绿色版）
 // 职责：单实例 → 准备配置 → 拉起本地缓存代理 → 等代理就绪 → 打开窗口
 //       → 首次运行创建桌面快捷方式 → 定期检查更新（一键升级）
-const { app, BrowserWindow, Menu, dialog, shell, Tray, nativeImage, Notification, safeStorage, nativeTheme, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, dialog, shell, Tray, nativeImage, Notification, safeStorage, nativeTheme, ipcMain, clipboard } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -908,8 +908,79 @@ function createWindow() {
     }
   });
 
+  // ---------------------------------------------------------------- 会话文件下载
+  // DSH 网页里点“文件”链接最终是一个 GET /api/file?path=... 的地址。
+  // 浏览器里靠自带下载/右键另存；Electron 壳里需要补上：拦截导航→下载、原生右键菜单、保存对话框。
+  const isLocalFileUrl = (raw) => {
+    try {
+      const u = new URL(raw);
+      if (!['127.0.0.1', 'localhost'].includes(u.hostname)) return false;
+      return u.pathname === '/api/file';
+    } catch { return false; }
+  };
+  const fileNameFromUrl = (raw) => {
+    try {
+      const u = new URL(raw);
+      const p = u.searchParams.get('path') || '';
+      return path.basename(p.replace(/[\\/]+$/, '')) || 'download';
+    } catch { return 'download'; }
+  };
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isLocalFileUrl(url)) return;
+    event.preventDefault();
+    try { mainWindow.webContents.downloadURL(url); } catch (e) { mainLog('下载文件失败: ' + String(e && e.message)); }
+  });
+  mainWindow.webContents.session.on('will-download', (event, item) => {
+    try {
+      item.setSaveDialogOptions({ title: '保存会话文件', defaultPath: path.join(app.getPath('downloads'), fileNameFromUrl(item.getURL())) });
+    } catch {}
+    item.once('done', (_e, state) => {
+      try {
+        if (state === 'completed') {
+          const target = item.getSavePath() || '下载目录';
+          mainLog('文件已保存: ' + target);
+          try { new Notification({ title: '文件已保存', body: target, silent: true }).show(); } catch {}
+        } else if (state === 'interrupted') {
+          mainLog('文件下载中断: ' + fileNameFromUrl(item.getURL()));
+          try { new Notification({ title: '文件下载失败', body: fileNameFromUrl(item.getURL()) }).show(); } catch {}
+        }
+      } catch {}
+    });
+  });
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    const menuItems = [];
+    const link = params.linkURL || '';
+    if (link) {
+      if (isLocalFileUrl(link)) {
+        menuItems.push({ label: '保存文件到本机…', click: () => { try { mainWindow.webContents.downloadURL(link); } catch {} } });
+        menuItems.push({ label: '用系统浏览器打开', click: () => { try { shell.openExternal(link).catch(() => {}); } catch {} } });
+      } else {
+        menuItems.push({ label: '在系统浏览器中打开链接', click: () => { try { shell.openExternal(link).catch(() => {}); } catch {} } });
+      }
+      menuItems.push({ label: '复制链接地址', click: () => { try { clipboard.writeText(link); } catch {} } });
+      menuItems.push({ type: 'separator' });
+    }
+    if (params.selectionText && params.selectionText.trim()) {
+      menuItems.push({ label: '复制', role: 'copy' });
+      menuItems.push({ type: 'separator' });
+    } else if (params.isEditable) {
+      menuItems.push({ label: '粘贴', role: 'paste' });
+      menuItems.push({ label: '全选', role: 'selectAll' });
+      menuItems.push({ type: 'separator' });
+    }
+    menuItems.push({ label: '重新加载', click: () => { try { mainWindow.reload(); } catch {} } });
+    if (!menuItems.length) return;
+    try { Menu.buildFromTemplate(menuItems).popup({ window: mainWindow }); } catch {}
+  });
+
   // 站内链接正常打开，外部链接走系统浏览器
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    // 会话里的文件链接是 <a target="_blank" href="/api/file?path=...">：
+    // 直接新开窗口只会显示内容/空白，用户无法“下载”。这里改成走下载流程（弹保存对话框）。
+    if (isLocalFileUrl(url)) {
+      try { mainWindow.webContents.downloadURL(url); } catch (e) { mainLog('下载文件失败: ' + String(e && e.message)); }
+      return { action: 'deny' };
+    }
     if (url.startsWith('http://127.0.0.1') || url.startsWith('http://localhost')) {
       return { action: 'allow' };
     }
