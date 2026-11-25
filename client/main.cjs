@@ -1644,8 +1644,16 @@ if (!gotLock) {
       (async () => {
         const it = inst(i);
         try {
-          if (await proxyAlive(i)) { mainLog(`实例「${it.name}」代理已在监听 :${it.port}`); return; }
-          if (await portOpen(it.port)) {
+          const extraInfo = await proxyInfo(i).catch(() => null);
+          if (extraInfo && extraInfo.version === app.getVersion()) {
+            mainLog(`实例「${it.name}」代理已就绪（v${extraInfo.version}）:${it.port}`);
+            return;
+          }
+          if (extraInfo) {
+            mainLog(`实例「${it.name}」端口上是旧代理 v${extraInfo.version}（当前 v${app.getVersion()}），先结束它`);
+            killStaleProxy(extraInfo.pid);
+            await new Promise((r) => setTimeout(r, 800));
+          } else if (await portOpen(it.port)) {
             const free = await pickFreePort(it.port + 1);
             if (free) { mainLog(`实例「${it.name}」端口 ${it.port} 被她程序占用，改用 ${free}`); it.port = free; }
             else { mainLog(`实例「${it.name}」找不到可用端口，跳过`); return; }
@@ -1683,6 +1691,8 @@ if (!gotLock) {
     isQuitting = true;
     if (checkTimer) clearInterval(checkTimer);
     stopNotifyWatcher();
-    stopProxy();
+    for (let i = 0; i < instances.length; i += 1) {
+      try { stopProxy(i); } catch {}
+    }
   });
 }
