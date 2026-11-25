@@ -837,6 +837,83 @@ function setupUpdater() {
 
 // ------------------------------------------------ 窗口
 
+/**
+ * 网页内注入：当表格/文档预览因超限等原因失败时（界面只有一个“重试”），
+ * 在旁边补一个“⬇ 下载此文件”，点击后由本机代理经 RPC 分块把文件拉下来。
+ */
+function downloadAssistScript() {
+  if (window.__dshDownloadAssist) return;
+  window.__dshDownloadAssist = true;
+  const ATTR = 'data-dsh-download-btn';
+  const startDownload = () => {
+    try {
+      const f = document.createElement('iframe');
+      f.style.display = 'none';
+      f.src = '/__proxy/download-last?t=' + Date.now();
+      document.body.appendChild(f);
+      setTimeout(() => { try { f.remove(); } catch (e) {} }, 120000);
+    } catch (e) {}
+  };
+  const makeButton = () => {
+    const b = document.createElement('button');
+    b.setAttribute(ATTR, '1');
+    b.textContent = '⬇ 下载此文件';
+    b.title = '把刚预览的文件保存到本机';
+    b.style.cssText = 'margin-left:8px;padding:2px 10px;border-radius:7px;border:1px solid #3a4657;background:#1c2634;color:#9db0ff;font-size:12px;cursor:pointer;vertical-align:middle';
+    b.addEventListener('click', (ev) => { ev.preventDefault(); ev.stopPropagation(); startDownload(); });
+    return b;
+  };
+  const scan = () => {
+    try {
+      for (const btn of document.querySelectorAll('button')) {
+        const t = (btn.textContent || '').trim();
+        if (t !== '重试' && t !== 'Retry') continue;
+        const parent = btn.parentElement;
+        if (!parent || parent.querySelector('[' + ATTR + ']')) continue;
+        parent.appendChild(makeButton());
+      }
+      for (const el of document.querySelectorAll('div,section,article')) {
+        if (el.querySelector('[' + ATTR + ']')) continue;
+        const t = (el.textContent || '').trim();
+        if (t.length > 90) continue;
+        if (!/预览大小限制|无法打开此表格|打开表格超时|无法识别此文本文件|超过预览大小上限|exceeds the preview size limit|too large to preview/i.test(t)) continue;
+        if (el.children.length > 4) continue;
+        el.appendChild(makeButton());
+      }
+    } catch (e) {}
+  };
+  const obs = new MutationObserver(() => {
+    clearTimeout(window.__dshDlTimer);
+    window.__dshDlTimer = setTimeout(scan, 250);
+  });
+  const start = () => { scan(); try { obs.observe(document.body, { childList: true, subtree: true }); } catch (e) {} };
+  if (document.body) start();
+  else document.addEventListener('DOMContentLoaded', start);
+}
+
+/** 通过本机代理下载最近一次预览过的文件（不依赖网页里的下载按钮）。 */
+function triggerPreviewDownload(win) {
+  const port = inst(currentInst).port || PROXY_PORT;
+  const req = http.get({ host: '127.0.0.1', port, path: '/__proxy/lastfile', timeout: 4000 }, (res) => {
+    let raw = '';
+    res.setEncoding('utf8');
+    res.on('data', (c) => { raw += c; });
+    res.on('end', () => {
+      let info = null;
+      try { info = JSON.parse(raw); } catch {}
+      if (!info || !(info.absolutePath || info.relPath)) {
+        try { dialog.showMessageBox(win, { type: 'info', message: '还没有预览记录', detail: '先在对话里点开一个文件（哪怕预览失败），再用这个菜单下载。' }); } catch {}
+        return;
+      }
+      try {
+        win.webContents.downloadURL('http://127.0.0.1:' + port + '/__proxy/download-last');
+      } catch (e) { mainLog('下载预览文件失败: ' + String(e && e.message)); }
+    });
+  });
+  req.on('error', (e) => { mainLog('下载预览文件通道不可用: ' + String(e && e.message)); });
+  req.on('timeout', () => { try { req.destroy(); } catch {} });
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -932,7 +1009,10 @@ function createWindow() {
   });
   mainWindow.webContents.session.on('will-download', (event, item) => {
     try {
-      item.setSaveDialogOptions({ title: '保存会话文件', defaultPath: path.join(app.getPath('downloads'), fileNameFromUrl(item.getURL())) });
+      let suggested = '';
+      try { suggested = String(item.getFilename() || ''); } catch {}
+      if (!suggested || suggested === 'download') suggested = fileNameFromUrl(item.getURL());
+      item.setSaveDialogOptions({ title: '保存会话文件', defaultPath: path.join(app.getPath('downloads'), suggested) });
     } catch {}
     item.once('done', (_e, state) => {
       try {
@@ -968,9 +1048,14 @@ function createWindow() {
       menuItems.push({ label: '全选', role: 'selectAll' });
       menuItems.push({ type: 'separator' });
     }
+    menuItems.push({ label: '下载当前预览的文件', click: () => { triggerPreviewDownload(mainWindow); } });
     menuItems.push({ label: '重新加载', click: () => { try { mainWindow.reload(); } catch {} } });
     if (!menuItems.length) return;
     try { Menu.buildFromTemplate(menuItems).popup({ window: mainWindow }); } catch {}
+  });
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    try { mainWindow.webContents.executeJavaScript('(' + downloadAssistScript.toString() + ')();').catch(() => {}); } catch {}
   });
 
   // 站内链接正常打开，外部链接走系统浏览器

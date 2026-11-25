@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.5.9';
+const VERSION = '1.5.10';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
@@ -982,6 +982,159 @@ function isStaticCacheable(reqPath) {
 
 // ---------------------------------------------------------------- 后台预取
 
+// ---------------------------------------------------------------- 预览文件下载
+// DSH 网页里“表格/文档预览”通过 workspaceFiles/readBytes 读取文件，原始内容不经过浏览器。
+// 预览失败（超限/无法打开）时界面没有下载按钮；这里记住最近一次预览的文件，
+// 提供一个“下载当前预览的文件”入口：优先 /api/file，一次一取太多就分块 RPC 拉取。
+let lastPreviewFile = null; // { absolutePath, bytes, relPath, scope, at }
+const PREVIEW_READ_RE = /^workspaceFiles\/(readBytes|read)$/;
+
+function parseMultipartParts(buf, contentType) {
+  const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(String(contentType || ''));
+  if (!m) return [];
+  const boundary = Buffer.from('--' + (m[1] || m[2] || '').trim(), 'latin1');
+  const delim = Buffer.from('\r\n' + boundary.toString('latin1'), 'latin1');
+  let start = buf.indexOf(boundary);
+  if (start < 0) return [];
+  const parts = [];
+  let pos = start + boundary.length;
+  for (let guard = 0; guard < 256; guard += 1) {
+    if (pos >= buf.length) break;
+    if (buf[pos] === 13 && buf[pos + 1] === 10) pos += 2;
+    if (buf[pos] === 45 && buf[pos + 1] === 45) break; // closing --
+    const headEnd = buf.indexOf(Buffer.from('\r\n\r\n', 'latin1'), pos);
+    if (headEnd < 0) break;
+    const head = buf.subarray(pos, headEnd).toString('utf8');
+    const next = buf.indexOf(delim, headEnd);
+    const end = next < 0 ? buf.length : next;
+    const nameM = /name="([^"]*)"/i.exec(head);
+    const fnM = /filename="([^"]*)"/i.exec(head);
+    parts.push({ name: nameM ? nameM[1] : null, filename: fnM ? fnM[1] : null, data: buf.subarray(headEnd + 4, end) });
+    if (next < 0) break;
+    pos = next + delim.length;
+  }
+  return parts;
+}
+
+function rememberPreviewFile(method, args, headers, body) {
+  try {
+    const relPath = args?.path;
+    const scope = args?.workspaceFileScopeId ?? args?.workspaceFileScope;
+    if (!relPath || !scope) return;
+    let absolutePath = null;
+    let bytes = null;
+    const ct = String(headers?.['content-type'] || '');
+    if (ct.includes('multipart/form-data')) {
+      for (const part of parseMultipartParts(body, ct)) {
+        if (part.name === 'metadata') {
+          const env = JSON.parse(part.data.toString('utf8'));
+          const value = env?.result?.value;
+          if (value?.absolutePath) absolutePath = String(value.absolutePath);
+          if (typeof value?.bytes === 'number') bytes = value.bytes;
+        }
+      }
+    } else {
+      const env = JSON.parse(body.toString('utf8'));
+      const value = env?.result?.value;
+      if (value?.absolutePath) absolutePath = String(value.absolutePath);
+      if (typeof value?.bytes === 'number') bytes = value.bytes;
+    }
+    lastPreviewFile = { absolutePath, bytes, relPath: String(relPath), scope: String(scope), at: Date.now() };
+  } catch {}
+}
+
+async function downloadLastFile(req, res) {
+  const f = lastPreviewFile;
+  if (!f || !(f.absolutePath || f.relPath)) {
+    return sendBuffer(res, 404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }, Buffer.from('没有找到可下载的文件（请先打开一次预览）'));
+  }
+  const name = String(f.absolutePath || f.relPath).split(/[\\/]/).pop() || 'download';
+  const disposition = "attachment; filename*=UTF-8''" + encodeURIComponent(name);
+  // 1) 先试 /api/file（DSH 自己的路由，小文件一次拿到）
+  if (f.absolutePath) {
+    try {
+      const headers = upstreamHeaders({ accept: '*/*', 'accept-encoding': 'identity', 'user-agent': req.headers['user-agent'] ?? 'dsh-client' });
+      const { res: upRes } = await requestUpstream({ method: 'GET', path: '/api/file?path=' + encodeURIComponent(f.absolutePath), headers, timeoutMs: 120000 });
+      if (upRes.statusCode === 200) {
+        const pass = { 'content-type': upRes.headers['content-type'] || 'application/octet-stream', 'cache-control': 'no-store', 'content-disposition': disposition };
+        if (upRes.headers['content-length']) pass['content-length'] = upRes.headers['content-length'];
+        res.writeHead(200, pass);
+        upRes.pipe(res);
+        stats.bigDownload = (stats.bigDownload ?? 0) + 1;
+        return;
+      }
+      upRes.resume();
+      diag('download', 'api/file 不可用，改分块', String(upRes.statusCode));
+    } catch (error) {
+      diag('download', 'api/file 失败', String(error?.message ?? error).slice(0, 120));
+    }
+  }
+  // 2) 分块 RPC 拉取（对话里的大文件走这里）
+  try {
+    const CHUNK = 2 * 1024 * 1024;
+    let offset = 0;
+    let first = true;
+    let total = typeof f.bytes === 'number' && f.bytes > 0 ? f.bytes : null;
+    let pathToRead = f.relPath;
+    let wroteHeader = false;
+    for (let guard = 0; guard < 4096; guard += 1) {
+      const payload = {
+        type: 'client-request', rpcId: 'dl-' + Math.random().toString(36).slice(2),
+        method: 'workspaceFiles/readBytes',
+        payload: { args: { workspaceFileScope: f.scope, path: pathToRead, options: { range: { offset, length: CHUNK } } } },
+      };
+      const body = Buffer.from(JSON.stringify(payload));
+      const headers = upstreamHeaders({
+        'content-type': 'application/json',
+        accept: 'multipart/form-data, application/json',
+        'accept-encoding': 'identity',
+        'content-length': body.length,
+      });
+      let up;
+      try {
+        up = await requestUpstream({ method: 'POST', path: '/api/workspaceFiles/readBytes', headers, body, timeoutMs: 120000 });
+      } catch (e) {
+        if (first && pathToRead !== f.absolutePath && f.absolutePath) { pathToRead = f.absolutePath; continue; }
+        throw e;
+      }
+      const chunks = [];
+      for await (const c of up.res) chunks.push(c);
+      const buf = Buffer.concat(chunks);
+      if (up.res.statusCode !== 200) throw new Error('分块下载 HTTP ' + up.res.statusCode);
+      const ct = String(up.res.headers['content-type'] || '');
+      let meta = null;
+      let data = null;
+      if (ct.includes('multipart/form-data')) {
+        for (const part of parseMultipartParts(buf, ct)) {
+          if (part.name === 'metadata') { try { meta = JSON.parse(part.data.toString('utf8')); } catch {} }
+          else if (part.name && /^bytes/.test(part.name)) data = part.data;
+        }
+      } else {
+        meta = JSON.parse(buf.toString('utf8'));
+      }
+      const value = meta?.result?.value;
+      if (!value) throw new Error('分块响应解析失败');
+      if (typeof value.bytes === 'number' && value.bytes > 0 && total === null) total = value.bytes;
+      if (!wroteHeader) {
+        const pass = { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'content-disposition': disposition };
+        if (total) pass['content-length'] = String(total);
+        res.writeHead(200, pass);
+        wroteHeader = true;
+      }
+      if (data && data.length > 0) { res.write(data); offset += data.length; }
+      first = false;
+      if (value.eof || !data || data.length === 0) break;
+      if (offset > 1024 * 1024 * 1024) break;
+    }
+    res.end();
+    stats.bigDownload = (stats.bigDownload ?? 0) + 1;
+  } catch (error) {
+    log('下载文件失败', String(error?.message ?? error).slice(0, 160));
+    if (!res.headersSent) sendBuffer(res, 502, { 'content-type': 'text/plain; charset=utf-8' }, Buffer.from('下载失败: ' + String(error?.message ?? error).slice(0, 200)));
+    else try { res.destroy(); } catch {}
+  }
+}
+
 async function rawApiCall(method, args, { accept = 'application/json', gzip = true } = {}) {
   const payload = {
     type: 'client-request',
@@ -1206,6 +1359,28 @@ async function handleApiPost(req, res, reqPath, body) {
       }
     }
   } catch {}
+
+  // 预览读取：缓冲响应，顺便记住文件路径（供“下载当前预览的文件”）
+  if (PREVIEW_READ_RE.test(String(method))) {
+    try {
+      const headers = upstreamHeaders({
+        'content-type': req.headers['content-type'] ?? 'application/json',
+        accept: req.headers.accept ?? 'application/json',
+        'accept-encoding': 'identity',
+        'content-length': body.length,
+        'user-agent': req.headers['user-agent'] ?? 'dsh-client',
+      });
+      const { res: upRes } = await requestUpstream({ method: 'POST', path: reqPath, headers, body });
+      const chunks = [];
+      for await (const c of upRes) chunks.push(c);
+      const upBody = Buffer.concat(chunks);
+      if (upRes.statusCode === 200) rememberPreviewFile(method, args, upRes.headers ?? {}, upBody);
+      return sendBuffer(res, upRes.statusCode ?? 502, upRes.headers ?? {}, upBody);
+    } catch (error) {
+      diag('preview', '缓冲失败，回退流式', String(error?.message ?? error).slice(0, 100));
+      return streamBufferUpstream(req, res, reqPath, body);
+    }
+  }
 
   // 写操作：透传并清缓存
   const mutating = MUTATING_RE.test(String(method));
@@ -1470,6 +1645,12 @@ const server = http.createServer(async (req, res) => {
         lastCleanup: stats.lastCleanup || null,
       };
       return sendBuffer(res, 200, { 'content-type': 'application/json' }, Buffer.from(JSON.stringify(payload)));
+    }
+    if (url.pathname === '/__proxy/lastfile') {
+      return sendBuffer(res, 200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, Buffer.from(JSON.stringify(lastPreviewFile ?? null)));
+    }
+    if (url.pathname === '/__proxy/download-last') {
+      return downloadLastFile(req, res);
     }
     if (url.pathname === '/__proxy/stats') {
       stats.listIndexSize = listIndex.size;
