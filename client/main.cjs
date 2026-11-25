@@ -847,9 +847,11 @@ function downloadAssistScript() {
   const ATTR = 'data-dsh-download-btn';
   const startDownload = () => {
     try {
+      const u = new URL('/__proxy/download-last', window.location.origin);
+      u.searchParams.set('t', String(Date.now()));
       const f = document.createElement('iframe');
       f.style.display = 'none';
-      f.src = '/__proxy/download-last?t=' + Date.now();
+      f.src = u.href;
       document.body.appendChild(f);
       setTimeout(() => { try { f.remove(); } catch (e) {} }, 120000);
     } catch (e) {}

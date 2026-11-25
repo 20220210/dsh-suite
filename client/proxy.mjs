@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.5.10';
+const VERSION = '1.5.11';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 
@@ -1624,7 +1624,12 @@ const server = http.createServer(async (req, res) => {
 
     if (req.headers.expect?.includes('100-continue')) res.writeContinue?.();
 
-    if (url.pathname === '/__proxy/selfcheck') {
+    // __proxy 本地路由：兼容带部署前缀的路径（如 /rc2/__proxy/...）
+    const proxyPath = (() => {
+      const i = url.pathname.indexOf('/__proxy/');
+      return i >= 0 ? url.pathname.slice(i) : url.pathname;
+    })();
+    if (proxyPath === '/__proxy/selfcheck') {
       const u = cacheUsage();
       const payload = {
         ok: Boolean(listSlot.body) && !stats.authError,
@@ -1646,13 +1651,13 @@ const server = http.createServer(async (req, res) => {
       };
       return sendBuffer(res, 200, { 'content-type': 'application/json' }, Buffer.from(JSON.stringify(payload)));
     }
-    if (url.pathname === '/__proxy/lastfile') {
+    if (proxyPath === '/__proxy/lastfile') {
       return sendBuffer(res, 200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }, Buffer.from(JSON.stringify(lastPreviewFile ?? null)));
     }
-    if (url.pathname === '/__proxy/download-last') {
+    if (proxyPath === '/__proxy/download-last') {
       return downloadLastFile(req, res);
     }
-    if (url.pathname === '/__proxy/stats') {
+    if (proxyPath === '/__proxy/stats') {
       stats.listIndexSize = listIndex.size;
       stats.listIndexAt = listIndexAt;
       stats.listNetAt = listNetAt;
