@@ -1392,6 +1392,47 @@ async function switchInstance(i) {
   buildMenu();
 }
 
+// ---------------------------------------------------------------- 内嵌网页（网页菜单）
+// config.json 里可配： "webApps": [{"name":"Key 台账","url":"https://dsh.example.com:19306/keys/"}]
+// 默认带一个 Key 台账；链接用同一个域名 19306 端口，鉴权沿用 BasicAuth/dshm。
+const DEFAULT_WEBAPPS = [{ name: 'Key 台账', url: 'https://dsh.example.com:19306/keys/' }];
+const webAppWindows = new Set();
+function webApps() {
+  const cfg = readConfig() || {};
+  const raw = Array.isArray(cfg.webApps) ? cfg.webApps : DEFAULT_WEBAPPS;
+  return raw
+    .map((x, i) => ({ name: String((x && x.name) || ('网页 ' + (i + 1))), url: String((x && x.url) || '') }))
+    .filter((x) => /^https?:\/\//i.test(x.url));
+}
+function openWebApp(def) {
+  try {
+    const win = new BrowserWindow({
+      width: 1200,
+      height: 820,
+      title: def.name,
+      parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+      autoHideMenuBar: true,
+      backgroundColor: '#0f1115',
+      webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+    });
+    webAppWindows.add(win);
+    win.on('closed', () => webAppWindows.delete(win));
+    win.webContents.setWindowOpenHandler(({ url }) => {
+      try {
+        const u = new URL(url);
+        const b = new URL(def.url);
+        if (u.host === b.host) return { action: 'allow' };
+      } catch {}
+      shell.openExternal(url).catch(() => {});
+      return { action: 'deny' };
+    });
+    win.loadURL(def.url).catch((e) => mainLog('打开网页失败: ' + String(e && e.message)));
+    return win;
+  } catch (e) {
+    mainLog('打开网页失败: ' + String(e && e.message));
+  }
+}
+
 function buildMenu() {
   const template = [
     ...(process.platform === 'darwin' ? [{
@@ -1455,6 +1496,14 @@ function buildMenu() {
       label: '实例',
       submenu: buildInstanceMenuItems(),
     },
+    ...(webApps().length ? [{
+      label: '网页',
+      submenu: [
+        ...webApps().map((w) => ({ label: w.name, click: () => openWebApp(w) })),
+        { type: 'separator' },
+        { label: '自定义网页列表（打开配置目录）', click: () => shell.openPath(userDataDir()).catch(() => {}) },
+      ],
+    }] : []),
     {
       label: '重连',
       click: () => { hardReconnect().catch(() => {}); },
@@ -1680,6 +1729,21 @@ if (!gotLock) {
       ensureStartMenuShortcut();
     }
     setupUpdater();
+  });
+
+  // 内嵌网页/内网服务需要 BasicAuth 时，自动用配置里的账号密码（不弹框）
+  app.on('login', (event, _wc, _details, authInfo, callback) => {
+    try {
+      if (!authInfo || authInfo.isProxy) return;
+      if (String(authInfo.scheme || '').toLowerCase() !== 'basic') return;
+      const cfg = readConfig() || {};
+      const rt = runtimeConfig();
+      const user = rt.basicUser || cfg.basicUser || '';
+      const pass = rt.basicPass || cfg.basicPass || '';
+      if (!user) return;
+      event.preventDefault();
+      callback(user, pass);
+    } catch {}
   });
 
   app.on('window-all-closed', () => {
