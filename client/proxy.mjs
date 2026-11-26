@@ -27,7 +27,7 @@ import { spawn, exec } from 'node:child_process';
 import { WebSocket } from 'ws';
 import { attachMux, prefetchFollowSnapshots } from './ws-mux.mjs';
 
-const VERSION = '1.6.1';
+const VERSION = '1.6.2';
 // 首屏只取最近 N 条消息（约 10 轮），更早的历史由前端 session/page 滚动加载
 const FOLLOW_MAX_MESSAGES = Number(process.env.DSH_FOLLOW_MAX_MESSAGES || 24);
 

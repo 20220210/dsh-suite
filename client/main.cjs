@@ -1415,8 +1415,7 @@ function openWebApp(def) {
       height: 820,
       title: def.name,
       parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
-      titleBarStyle: isMac ? 'hidden' : 'default',
-      trafficLightPosition: isMac ? { x: 16, y: 14 } : undefined,
+      frame: false,
       autoHideMenuBar: true,
       backgroundColor: '#0f1115',
     });
@@ -1476,7 +1475,11 @@ ipcMain.on('dsh-webapp-bar', (event, action) => {
   const entry = webAppViews.get(event.sender.id);
   if (!entry) return;
   try {
+    const win = entry.win;
     if (action === 'refresh') entry.pageView.webContents.reload();
+    else if (action === 'close') win.close();
+    else if (action === 'minimize') win.minimize();
+    else if (action === 'togglemax') { if (win.isMaximized()) win.unmaximize(); else win.maximize(); }
   } catch (e) {
     mainLog('网页操作失败: ' + String(e && e.message));
   }

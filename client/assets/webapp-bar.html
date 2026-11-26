@@ -3,27 +3,36 @@
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#0f1115;color:#dfe6f3;
     font:13px -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
-    -webkit-app-region:drag;user-select:none}
-  .bar{display:flex;align-items:center;height:100%;gap:10px;padding:0 12px 0 84px;
+    user-select:none}
+  body{-webkit-app-region:drag}
+  .bar{display:flex;align-items:center;height:100%;gap:10px;padding:0 10px 0 16px;
     border-bottom:1px solid rgba(255,255,255,.08);box-sizing:border-box}
-  .title{font-weight:600;letter-spacing:.2px}
+  .title{font-weight:600;letter-spacing:.2px;white-space:nowrap}
   button{-webkit-app-region:no-drag;cursor:pointer;font:12px inherit;color:#9db0ff;
-    background:#1c2634;border:1px solid #3a4657;border-radius:7px;padding:3px 10px}
+    background:#1c2634;border:1px solid #3a4657;border-radius:7px;padding:3px 10px;line-height:1.5}
   button:hover{background:#243247}
   .spacer{flex:1}
-  @media (max-width: 640px){ .bar{padding-left:12px} }
+  .win-btn{background:transparent;border:none;color:#8b93a3;font-size:13px;padding:4px 9px;border-radius:6px}
+  .win-btn:hover{background:#232c3c;color:#fff}
+  .close:hover{background:#c0392b;color:#fff}
 </style></head>
 <body><div class="bar">
   <span class="title" id="title">工作台</span>
-  <button id="refresh" title="刷新页面 (⌘R)">⟳ 刷新</button>
+  <button id="refresh" title="刷新页面 (⌘R / Ctrl+R)">⟳ 刷新</button>
   <span class="spacer"></span>
+  <button class="win-btn" id="min" title="最小化">—</button>
+  <button class="win-btn close" id="close" title="关闭">✕</button>
 </div>
 <script>
   const params = new URLSearchParams(location.search);
   const t = params.get('title');
   if (t) document.getElementById('title').textContent = t;
-  document.getElementById('refresh').addEventListener('click', () => { try { window.barApi.refresh(); } catch (e) {} });
+  const call = (a) => { try { window.barApi.call(a); } catch (e) {} };
+  document.getElementById('refresh').addEventListener('click', () => call('refresh'));
+  document.getElementById('min').addEventListener('click', () => call('minimize'));
+  document.getElementById('close').addEventListener('click', () => call('close'));
+  document.body.addEventListener('dblclick', (e) => { if (e.target === document.body || e.target.closest('.bar') && !e.target.closest('button')) call('togglemax'); });
   document.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') { e.preventDefault(); try { window.barApi.refresh(); } catch (err) {} }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') { e.preventDefault(); call('refresh'); }
   });
 </script></body></html>
