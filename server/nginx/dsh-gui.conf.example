@@ -145,6 +145,34 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
     }
 
+    # 内嵌网页示例：本机 8910 的「工作台」页面（BasicAuth 同款鉴权）
+    # 页面里的 /api/... 绝对路径用 sub_filter 改写成 /keys/api/...
+    location /keys/ {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:8910/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Accept-Encoding "";
+        proxy_read_timeout 120s;
+        add_header Cache-Control "no-store";
+        sub_filter_types text/html application/javascript text/javascript;
+        sub_filter "'/api/" "'/keys/api/";
+        sub_filter "\"/api/" "\"/keys/api/";
+        sub_filter_once off;
+    }
+    location /keys/api/ {
+        auth_request /dshm-check;
+        satisfy any;
+        proxy_pass http://127.0.0.1:8910/api/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 120s;
+        add_header Cache-Control "no-store";
+    }
+
     location /downloads/ {
         alias /var/www/dsh-downloads/;
         autoindex off;
