@@ -1,0 +1,29 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0f1115;color:#dfe6f3;
+    font:13px -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    -webkit-app-region:drag;user-select:none}
+  .bar{display:flex;align-items:center;height:100%;gap:10px;padding:0 12px 0 84px;
+    border-bottom:1px solid rgba(255,255,255,.08);box-sizing:border-box}
+  .title{font-weight:600;letter-spacing:.2px}
+  button{-webkit-app-region:no-drag;cursor:pointer;font:12px inherit;color:#9db0ff;
+    background:#1c2634;border:1px solid #3a4657;border-radius:7px;padding:3px 10px}
+  button:hover{background:#243247}
+  .spacer{flex:1}
+  @media (max-width: 640px){ .bar{padding-left:12px} }
+</style></head>
+<body><div class="bar">
+  <span class="title" id="title">工作台</span>
+  <button id="refresh" title="刷新页面 (⌘R)">⟳ 刷新</button>
+  <span class="spacer"></span>
+</div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const t = params.get('title');
+  if (t) document.getElementById('title').textContent = t;
+  document.getElementById('refresh').addEventListener('click', () => { try { window.barApi.refresh(); } catch (e) {} });
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') { e.preventDefault(); try { window.barApi.refresh(); } catch (err) {} }
+  });
+</script></body></html>

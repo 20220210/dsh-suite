@@ -1,7 +1,7 @@
 // DSH 桌面版 v1.2.0 —— Electron 主进程（绿色版）
 // 职责：单实例 → 准备配置 → 拉起本地缓存代理 → 等代理就绪 → 打开窗口
 //       → 首次运行创建桌面快捷方式 → 定期检查更新（一键升级）
-const { app, BrowserWindow, Menu, dialog, shell, Tray, nativeImage, Notification, safeStorage, nativeTheme, ipcMain, clipboard } = require('electron');
+const { app, BrowserWindow, WebContentsView, Menu, dialog, shell, Tray, nativeImage, Notification, safeStorage, nativeTheme, ipcMain, clipboard } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -1395,7 +1395,7 @@ async function switchInstance(i) {
 // ---------------------------------------------------------------- 内嵌网页（网页菜单）
 // config.json 里可配： "webApps": [{"name":"Key 台账","url":"https://dsh.example.com:19306/keys/"}]
 // 默认带一个 Key 台账；链接用同一个域名 19306 端口，鉴权沿用 BasicAuth/dshm。
-const DEFAULT_WEBAPPS = [{ name: 'Key 台账', url: 'https://dsh.example.com:19306/keys/' }];
+const DEFAULT_WEBAPPS = [{ name: '工作台', url: 'https://dsh.example.com:19306/keys/' }];
 const webAppWindows = new Set();
 function webApps() {
   const cfg = readConfig() || {};
@@ -1404,20 +1404,49 @@ function webApps() {
     .map((x, i) => ({ name: String((x && x.name) || ('网页 ' + (i + 1))), url: String((x && x.url) || '') }))
     .filter((x) => /^https?:\/\//i.test(x.url));
 }
+const webAppViews = new Map(); // 顶栏 webContents.id -> { win, barView, pageView, def }
+const WEBAPP_BAR_HEIGHT = 42;
+
 function openWebApp(def) {
   try {
+    const isMac = process.platform === 'darwin';
     const win = new BrowserWindow({
       width: 1200,
       height: 820,
       title: def.name,
       parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+      titleBarStyle: isMac ? 'hidden' : 'default',
+      trafficLightPosition: isMac ? { x: 16, y: 14 } : undefined,
       autoHideMenuBar: true,
       backgroundColor: '#0f1115',
+    });
+    const barView = new WebContentsView({
+      webPreferences: {
+        preload: path.join(__dirname, 'assets', 'webapp-bar-preload.cjs'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: false,
+      },
+    });
+    const pageView = new WebContentsView({
       webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
     });
-    webAppWindows.add(win);
-    win.on('closed', () => webAppWindows.delete(win));
-    win.webContents.setWindowOpenHandler(({ url }) => {
+    try { barView.setBackgroundColor('#0f1115'); } catch {}
+    try { pageView.setBackgroundColor('#0f1115'); } catch {}
+    win.contentView.addChildView(barView);
+    win.contentView.addChildView(pageView);
+    const layout = () => {
+      try {
+        const [w, h] = win.getContentSize();
+        barView.setBounds({ x: 0, y: 0, width: w, height: WEBAPP_BAR_HEIGHT });
+        pageView.setBounds({ x: 0, y: WEBAPP_BAR_HEIGHT, width: w, height: Math.max(0, h - WEBAPP_BAR_HEIGHT) });
+      } catch {}
+    };
+    layout();
+    win.on('resize', layout);
+    // 顶栏固定显示“工作台”，不跟随网页标题变化
+    pageView.webContents.on('page-title-updated', (event) => { event.preventDefault(); });
+    pageView.webContents.setWindowOpenHandler(({ url }) => {
       try {
         const u = new URL(url);
         const b = new URL(def.url);
@@ -1426,12 +1455,32 @@ function openWebApp(def) {
       shell.openExternal(url).catch(() => {});
       return { action: 'deny' };
     });
-    win.loadURL(def.url).catch((e) => mainLog('打开网页失败: ' + String(e && e.message)));
+    const entry = { win, barView, pageView, def };
+    webAppViews.set(barView.webContents.id, entry);
+    barView.webContents.loadFile(path.join(__dirname, 'assets', 'webapp-bar.html'), { query: { title: def.name } }).catch(() => {});
+    pageView.webContents.loadURL(def.url).catch((e) => mainLog('打开网页失败: ' + String(e && e.message)));
+    win.on('closed', () => {
+      webAppViews.delete(barView.webContents.id);
+      webAppWindows.delete(win);
+      try { barView.webContents.close(); } catch {}
+      try { pageView.webContents.close(); } catch {}
+    });
+    webAppWindows.add(win);
     return win;
   } catch (e) {
     mainLog('打开网页失败: ' + String(e && e.message));
   }
 }
+
+ipcMain.on('dsh-webapp-bar', (event, action) => {
+  const entry = webAppViews.get(event.sender.id);
+  if (!entry) return;
+  try {
+    if (action === 'refresh') entry.pageView.webContents.reload();
+  } catch (e) {
+    mainLog('网页操作失败: ' + String(e && e.message));
+  }
+});
 
 function buildMenu() {
   const template = [
